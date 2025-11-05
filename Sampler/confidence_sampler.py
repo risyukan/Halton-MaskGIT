@@ -15,7 +15,7 @@ class ConfidenceSampler(object):
         self.sched_mode = sched_mode
         self.step = step
 
-    def __str__(self):
+    def __str__(self): #print的时候会调用这个函数
         s = f"Scheduler: Confidence, " \
             f"Sequence: {self.sched_mode}, Steps: {self.step}, " \
             f"SoftMax temp: {self.sm_temp}, CFG w: {self.w}, " \
