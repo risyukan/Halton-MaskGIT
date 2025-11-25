@@ -11,11 +11,13 @@ ours_speedup = np.array([1.00, 1.30, 1.71, 2.22])
 
 # ToMeSD 方法（从表中读的相対速度）
 tomesd_speedup = np.array([1.00, 0.88, 1.05, 1.22])
+layer_tomesd = np.array([1.00, 1.29, 1.68, 2.17])
 
 plt.figure(figsize=(6, 4))
 
 plt.plot(keep_ratio, ours_speedup, marker='o', linestyle='-', label='Ours')
 plt.plot(keep_ratio, tomesd_speedup, marker='s', linestyle='--', label='ToMeSD')
+plt.plot(keep_ratio, layer_tomesd, marker='^', linestyle='-.', label='Layer ToMeSD')
 
 plt.xlabel('Token keep ratio')
 plt.ylabel('Speedup over baseline (×)')
