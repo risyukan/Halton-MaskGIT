@@ -8,12 +8,9 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import Tuple, Callable
 
 from einops import rearrange
-from Sampler.halton_sampler import HaltonSampler  # Replace with the correct module if different
-from Sampler.halton_sampler import _halton_centers_and_assignments_sq
-from Sampler.halton_sampler import _merge_tokens_spatial
-from Sampler.halton_sampler import _unmerge_tokens_spatial
 
 
 def param_count(archi, model):
@@ -23,6 +20,128 @@ def param_count(archi, model):
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+#以下是tomesd的部分代码
+def do_nothing(x: torch.Tensor, mode:str=None):
+    return x
+
+
+def mps_gather_workaround(input, dim, index):
+    if input.shape[-1] == 1:
+        return torch.gather(
+            input.unsqueeze(-1),
+            dim - 1 if dim < 0 else dim,
+            index.unsqueeze(-1)
+        ).squeeze(-1)
+    else:
+        return torch.gather(input, dim, index)
+
+
+def bipartite_soft_matching_random2d(metric: torch.Tensor,
+                                     w: int, h: int, sx: int, sy: int, r: int,
+                                     no_rand: bool = False,
+                                     generator: torch.Generator = None) -> Tuple[Callable, Callable]:
+    """
+    Partitions the tokens into src and dst and merges r tokens from src to dst.
+    Dst tokens are partitioned by choosing one randomy in each (sx, sy) region.
+
+    Args:
+     - metric [B, N, C]: metric to use for similarity
+     - w: image width in tokens
+     - h: image height in tokens
+     - sx: stride in the x dimension for dst, must divide w
+     - sy: stride in the y dimension for dst, must divide h
+     - r: number of tokens to remove (by merging)
+     - no_rand: if true, disable randomness (use top left corner only)
+     - rand_seed: if no_rand is false, and if not None, sets random seed.
+    """
+    B, N, _ = metric.shape
+
+    if r <= 0:
+        return do_nothing, do_nothing
+
+    gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
+    
+    with torch.no_grad():
+        hsy, wsx = h // sy, w // sx
+
+        # For each sy by sx kernel, randomly assign one token to be dst and the rest src
+        if no_rand:
+            rand_idx = torch.zeros(hsy, wsx, 1, device=metric.device, dtype=torch.int64)
+        else:
+            rand_idx = torch.randint(sy*sx, size=(hsy, wsx, 1), device=generator.device, generator=generator).to(metric.device)
+        
+        # The image might not divide sx and sy, so we need to work on a view of the top left if the idx buffer instead
+        idx_buffer_view = torch.zeros(hsy, wsx, sy*sx, device=metric.device, dtype=torch.int64)
+        idx_buffer_view.scatter_(dim=2, index=rand_idx, src=-torch.ones_like(rand_idx, dtype=rand_idx.dtype))
+        idx_buffer_view = idx_buffer_view.view(hsy, wsx, sy, sx).transpose(1, 2).reshape(hsy * sy, wsx * sx)
+
+        # Image is not divisible by sx or sy so we need to move it into a new buffer
+        if (hsy * sy) < h or (wsx * sx) < w:
+            idx_buffer = torch.zeros(h, w, device=metric.device, dtype=torch.int64)
+            idx_buffer[:(hsy * sy), :(wsx * sx)] = idx_buffer_view
+        else:
+            idx_buffer = idx_buffer_view
+
+        # We set dst tokens to be -1 and src to be 0, so an argsort gives us dst|src indices
+        rand_idx = idx_buffer.reshape(1, -1, 1).argsort(dim=1)
+
+        # We're finished with these
+        del idx_buffer, idx_buffer_view
+
+        # rand_idx is currently dst|src, so split them
+        num_dst = hsy * wsx
+        a_idx = rand_idx[:, num_dst:, :] # src
+        b_idx = rand_idx[:, :num_dst, :] # dst
+
+        def split(x):
+            C = x.shape[-1]
+            src = gather(x, dim=1, index=a_idx.expand(B, N - num_dst, C))
+            dst = gather(x, dim=1, index=b_idx.expand(B, num_dst, C))
+            return src, dst
+
+        # Cosine similarity between A and B
+        metric = F.normalize(metric, dim=-1, eps=1e-6)
+        a, b = split(metric)
+        scores = a @ b.transpose(-1, -2)
+
+        # Can't reduce more than the # tokens in src
+        r = min(a.shape[1], r)
+
+        # Find the most similar greedily
+        node_max, node_idx = scores.max(dim=-1)
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+
+        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
+        src_idx = edge_idx[..., :r, :]  # Merged Tokens
+        dst_idx = gather(node_idx[..., None], dim=-2, index=src_idx)
+
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = split(x)
+        n, t1, c = src.shape
+        
+        unm = gather(src, dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = gather(src, dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+
+        return torch.cat([unm, dst], dim=1)
+
+    def unmerge(x: torch.Tensor) -> torch.Tensor:
+        unm_len = unm_idx.shape[1]
+        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+        _, _, c = unm.shape
+
+        src = gather(dst, dim=-2, index=dst_idx.expand(B, r, c))
+
+        # Combine back to the original shape
+        out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
+        out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
+        out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
+        out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
+
+        return out
+
+    return merge, unmerge
 
 
 class FeedForward(nn.Module):
@@ -178,18 +297,26 @@ class Transformer(nn.Module):
     """ DiT-like transformer with adaLayerNorm with zero initializations """
     def __init__(self, input_size=16, hidden_dim=768, codebook_size=1024,
                  depth=12, heads=16, mlp_dim=3072, dropout=0., nclass=1000,
-                 register=1, proj=1, **kwargs):
+                 register=1, proj=1,
+                 # ==== ToMeSD 相关参数 ====
+                 tome_keep_ratio: float = 1.0,   # 保留多少比例的 image tokens（0~1，1=不开启 ToMe）
+                 tome_sx: int = 2,
+                 tome_sy: int = 2,
+                 tome_no_rand: bool = False,
+                 tome_merge_layer_idx: int = 0,   # 在第1个 layer 之前 merge
+                 tome_unmerge_before_idx: int = -1,  # 在第几个 layer 之前 unmerge；-1 表示在最后一层前
+                 **kwargs):
         super().__init__()
 
-        self.nclass = nclass                                             # Number of classes
-        self.input_size = input_size                                     # Number of tokens as input
-        self.hidden_dim = hidden_dim                                     # Hidden dimension of the transformer
-        self.codebook_size = codebook_size                               # Amount of code in the codebook
-        self.proj = proj                                                 # Projection
+        self.nclass = nclass                       # Number of classes
+        self.input_size = input_size               # Number of tokens as input (sqrt)
+        self.hidden_dim = hidden_dim               # Hidden dimension of the transformer
+        self.codebook_size = codebook_size         # Amount of code in the codebook
+        self.proj = proj                           # Projection
 
-        self.cls_emb = nn.Embedding(nclass + 1, hidden_dim)              # Embedding layer for the class token
-        self.tok_emb = nn.Embedding(codebook_size + 1, hidden_dim)       # Embedding layer for the 'visual' token
-        self.pos_emb = nn.Embedding(input_size ** 2, hidden_dim)         # Learnable Positional Embedding
+        self.cls_emb = nn.Embedding(nclass + 1, hidden_dim)        # Embedding layer for the class token
+        self.tok_emb = nn.Embedding(codebook_size + 1, hidden_dim) # Embedding layer for the 'visual' token
+        self.pos_emb = nn.Embedding(input_size ** 2, hidden_dim)   # Learnable Positional Embedding
 
         if self.proj > 1:
             self.in_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False)
@@ -198,7 +325,9 @@ class Transformer(nn.Module):
             ).to(memory_format=torch.channels_last)
 
         # The Transformer Encoder a la BERT :)
-        self.transformer = TransformerEncoder(dim=hidden_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout)
+        self.transformer = TransformerEncoder(
+            dim=hidden_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout
+        )
 
         self.last_norm = AdaNorm(x_dim=hidden_dim, y_dim=hidden_dim)   # Last Norm
 
@@ -209,13 +338,21 @@ class Transformer(nn.Module):
         if self.register > 0:
             self.reg_tokens = nn.Embedding(self.register, hidden_dim)
 
+        # ==== ToMeSD 配置 ====
+        self.tome_keep_ratio = tome_keep_ratio
+        self.tome_sx = tome_sx
+        self.tome_sy = tome_sy
+        self.tome_no_rand = tome_no_rand
+
+        # layer index 合法化
+        self.depth = depth
+        self.tome_merge_layer_idx = max(0, min(depth - 1, tome_merge_layer_idx))
+        if tome_unmerge_before_idx < 0:
+            self.tome_unmerge_before_idx = depth - 1
+        else:
+            self.tome_unmerge_before_idx = max(0, min(depth - 1, tome_unmerge_before_idx))
+
         self.initialize_weights()  # Init weight
-        # ---- Halton-Token-Merge 配置 ----
-        self.tome_keep_ratio = kwargs.get("tome_keep_ratio", 1.0)  # 1.0=不合并；比如 0.5=保留一半 token
-        self.tome_merge_layer_idx = kwargs.get("tome_merge_layer_idx", 0)  # 第 1 层前合并
-        self.tome_unmerge_before_idx = kwargs.get("tome_unmerge_before_idx", -1)  # 最后一层前反合并
-        self.tome_random_roll = kwargs.get("tome_random_roll", False)  # 如需随机 roll Halton 序列可用
-        self._tome_cache = {}  # key=(h,w,M,device) -> {"centers":..., "ids":..., "counts":...}
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -242,130 +379,163 @@ class Transformer(nn.Module):
             nn.init.xavier_uniform_(self.in_proj.weight)
             nn.init.xavier_uniform_(self.out_proj.weight)
 
-        # Init embedding
+        # Init register tokens
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
     def forward(self, x, y, drop_label, mask=None):
+        """
+        x: [B, H, W]  离散 codebook index
+        y: [B]        类别 label
+        """
         b, h, w = x.size()
         x = x.reshape(b, h * w)
 
         # Drop the label if drop_label
         y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
-        y = self.cls_emb(y)
+        y = self.cls_emb(y)  # [B, C]
 
-        # 位置编码（按原样）
+        # position embedding
         pos = torch.arange(0, w * h, dtype=torch.long, device=x.device)
-        pos = self.pos_emb(pos)
+        pos = self.pos_emb(pos)  # [H*W, C]
 
-        x = self.tok_emb(x) + pos  # [B, N, C], N=h*w
+        x = self.tok_emb(x) + pos  # [B, H*W, C]
 
-        # optional 下采样 patchify
+        # reshape, proj to smaller space, reshape (patchify!)
         if self.proj > 1:
-            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
-            x = self.in_proj(x)  # stride=2
-            _, _, h, w = x.shape
-            x = rearrange(x, 'b c h w -> b (h w) c', b=b, c=self.hidden_dim, h=h, w=w).contiguous()
+            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+            x = self.in_proj(x)
+            _, _, h, w = x.shape                 # 更新下采样后的 h, w
+            x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
 
-        # ===== 这里开始：准备 register token，并在进入 blocks 前做 ToMe 合并 =====
-        reg_tok = None
+        img_len = h * w  # 纯 image token 的长度
+
+        # 可选 register tokens（不参与 ToMe merge）
         if self.register > 0:
-            reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
-            reg_tok = self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)  # [B,R,C]
-            # 注意：合并只对空间 token 生效，register 不参与合并
+            reg_idx = torch.arange(0, self.register, dtype=torch.long, device=x.device)
+            reg_tokens = self.reg_tokens(reg_idx).expand(b, self.register, self.hidden_dim)
+            x = torch.cat([x, reg_tokens], dim=1)  # [B, img_len + R, C]
 
-        N = h * w  # 空间 token 数
-        use_tome = (self.tome_keep_ratio is not None) and (self.tome_keep_ratio < 1.0) and (N > 0)
+        # ================== ToMeSD 配置判断 ==================
+        # 只在 mask 为空 & keep_ratio 在 (0, 1) 时启用 ToMe
+        apply_tome = (
+            (mask is None)
+            and (self.tome_keep_ratio is not None)
+            and (0.0 < self.tome_keep_ratio < 1.0)
+        )
 
-        # 构建合并后的输入序列 x_for_blocks，以及为反合并准备的映射
-        tome_ctx = None
-        if use_tome:
-            # 计算 M（合并后保留的 token 数）
-            M = max(1, int(round(N * self.tome_keep_ratio)))
+        merge_applied = False
+        unmerge_done = False
+        merge_info = None   # 存 unmerge 函数等信息
 
-            # 取/建缓存
-            key = (h, w, M, x.device.type)
-            if key not in self._tome_cache:
-                # 仅支持正方形网格；如果将来 h!=w，需要相应修改为长方形 Halton
-                assert h == w, f"Halton-ToMe 当前实现仅支持正方形网格，got h={h}, w={w}"
-                builder = _halton_centers_and_assignments_sq(h, M, x.device)
-                centers, cluster_ids, counts = builder(M)
-                if self.tome_random_roll:
-                    # 可选：对 halton 序列整体 roll，做一点随机性
-                    shift = torch.randint(0, N, (1,), device=x.device).item()
-                    order = torch.arange(N, device=x.device)
-                    cluster_ids = cluster_ids[order.roll(shifts=shift)]
-                self._tome_cache[key] = {
-                    "centers": centers,            # [M,2] 目前没直接用到，但保留
-                    "ids": cluster_ids,            # [N]
-                    "counts": counts               # [M]
-                }
-            ids = self._tome_cache[key]["ids"]
-            counts = self._tome_cache[key]["counts"]
+        layers = self.transformer.layers
+        num_layers = len(layers)
 
-            # 只合并空间 token
-            x_sp = x[:, :N, :]                                # [B,N,C]
-            x_sp_m = _merge_tokens_spatial(x_sp, ids, counts) # [B,M,C]
+        for i, block in enumerate(layers):
 
-            # 与 register token 重新拼接得到进入 blocks 的序列
-            if reg_tok is not None:
-                x_for_blocks = torch.cat([x_sp_m, reg_tok], dim=1)   # [B, M+R, C]
-            else:
-                x_for_blocks = x_sp_m                                 # [B, M, C]
+            # ---- 在指定 layer 之前 unmerge ----
+            if apply_tome and merge_applied and (not unmerge_done) and (i == self.tome_unmerge_before_idx):
+                # 拆成 image / register
+                merged_img_len = merge_info["merged_img_len"]
+                img_part = x[:, :merged_img_len, :]
+                reg_part = x[:, merged_img_len:, :] if self.register > 0 else None
 
-            tome_ctx = {
-                "ids": ids, "counts": counts, "N": N, "M": M, "has_reg": reg_tok is not None
-            }
-        else:
-            # 不启用合并：保持原样
-            x_for_blocks = torch.cat([x, reg_tok], dim=1) if reg_tok is not None else x
-
-        # ======= 进入 Transformer blocks：第 1 层前已合并；最后一层前反合并 =======
-        L = len(self.transformer.layers)
-        unmerge_before = self.tome_unmerge_before_idx if self.tome_unmerge_before_idx >= 0 else (L - 1)
-
-        for i, block in enumerate(self.transformer.layers):
-            # 在最后一层 block 之前把 token 反合并回原始长度（仅当启用 ToMe）
-            if use_tome and i == unmerge_before:
-                if tome_ctx["has_reg"]:
-                    x_sp_m, x_reg = x_for_blocks[:, :tome_ctx["M"], :], x_for_blocks[:, tome_ctx["M"]:, :]
+                full_img = merge_info["unmerge_fn"](img_part)  # [B, img_len, C]
+                if reg_part is not None:
+                    x = torch.cat([full_img, reg_part], dim=1)
                 else:
-                    x_sp_m, x_reg = x_for_blocks, None
+                    x = full_img
 
-                x_sp_full = _unmerge_tokens_spatial(x_sp_m, tome_ctx["ids"])  # [B,N,C]
+                unmerge_done = True
 
-                x_for_blocks = torch.cat([x_sp_full, x_reg], dim=1) if x_reg is not None else x_sp_full
-                # 注意：反合并后，后续 block（也就是最后一个 block）将对“完整长度”的序列计算
+            # ---- 在指定 layer 之前 merge ----
+            if apply_tome and (not merge_applied) and (i == self.tome_merge_layer_idx):
+                # 当前的 image tokens（注意：可能已经过了前面的 blocks）
+                img_part = x[:, :img_len, :]                     # [B, N, C]
 
-            # 关于 mask：
-            #   合并阶段（前 L-1 层）序列长度变化，mask 需要同步聚合；若你的训练里不依赖 mask，推荐传 None。
-            #   最后一层已反合并，我们把原 mask 直接传给最后一层（如果你需要）。
-            if (use_tome and i < unmerge_before):
-                x_for_blocks = block(x_for_blocks, y, mask=None)
+                # 根据当前 N 动态算 r
+                N = img_len
+                r = int(round(N * (1.0 - self.tome_keep_ratio)))
+                # 控制在合法范围
+                r = max(0, min(N - 1, r))
+
+                if r > 0:
+                    metric = img_part                            # 直接用当前 hidden 作为 metric
+                    gen = torch.Generator(device=x.device)
+
+                    merge_fn, unmerge_fn = bipartite_soft_matching_random2d(
+                        metric=metric,
+                        w=w,
+                        h=h,
+                        sx=self.tome_sx,
+                        sy=self.tome_sy,
+                        r=r,
+                        no_rand=self.tome_no_rand,
+                        generator=gen,
+                    )
+
+                    img_merged = merge_fn(img_part)              # [B, N - r, C]
+                    merged_img_len = img_merged.shape[1]
+
+                    reg_part = x[:, img_len:, :] if self.register > 0 else None
+                    if reg_part is not None:
+                        x = torch.cat([img_merged, reg_part], dim=1)
+                    else:
+                        x = img_merged
+
+                    merge_applied = True
+                    merge_info = {
+                        "unmerge_fn": unmerge_fn,
+                        "merged_img_len": merged_img_len,
+                        "full_img_len": N,
+                    }
+                else:
+                    # r == 0 相当于不 merge
+                    apply_tome = False
+
+            # ---- 正常过 block ----
+            x = block(x, y, mask=mask)
+
+        # 如果用户把 unmerge_before_idx 设得很大，导致循环结束还没 unmerge，
+        # 这里可以按需要选择是否强制 unmerge 一下（目前我们保持「按配置来」，不强制）。
+        if apply_tome and merge_applied and (not unmerge_done):
+            # 也可以在这里强制 unmerge（可选）
+            merged_img_len = merge_info["merged_img_len"]
+            img_part = x[:, :merged_img_len, :]
+            reg_part = x[:, merged_img_len:, :] if self.register > 0 else None
+
+            full_img = merge_info["unmerge_fn"](img_part)
+            if reg_part is not None:
+                x = torch.cat([full_img, reg_part], dim=1)
             else:
-                x_for_blocks = block(x_for_blocks, y, mask=mask)
+                x = full_img
 
-        x = x_for_blocks  # [B, (N或M)+R, C]，取决于最后是否已反合并
+            unmerge_done = True
 
-        # 去掉 register，仅保留空间 token（此时若启用 ToMe，已反合并回 N）
-        x = x[:, :h * w].contiguous()
+        # drop the register，只保留 image tokens
+        x = x[:, :img_len].contiguous()  # [B, img_len, C]
 
-        # optional 上采样还原 token 网格（按你原逻辑）
+        # 反投影回原分辨率
         if self.proj > 1:
-            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
+            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
             x = self.out_proj(x)
-            x = rearrange(x, 'b (c s1 s2) h w -> b (h s1 w s2) c',
-                          s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim).contiguous()
+            x = rearrange(
+                x,
+                'b (c s1 s2) h w -> b (h s1 w s2) c',
+                s1=self.proj,
+                s2=self.proj
+            ).contiguous()
 
-        x = self.last_norm(x, y)
-        logit = self.head(x)
+        x = self.last_norm(x, y)       # [B, img_len(或放大后), C]
+        logit = self.head(x)           # [B, img_len(...), codebook_size+1]
+
         return logit
 
 
 
 if __name__ == "__main__":
     from thop import profile
-    # 测试不同规模的transformer的FLOPs和参数量
+
     for size in ["tiny", "small", "base"]: # "large", "xlarge"]:
         # size = "tiny"
         print(size)
@@ -393,4 +563,5 @@ if __name__ == "__main__":
 
         flops, params = profile(model, inputs=(code, cls, d_label))
         print(f"FLOPs: {flops//1e9:.2f}G, Params: {params/1e6:.2f}M")
+
 

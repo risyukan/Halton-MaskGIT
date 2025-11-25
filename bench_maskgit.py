@@ -218,7 +218,7 @@ args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 args.vit_size = "large"  # "tiny", "small", "base", "large"
 args.img_size = 384  # 256 or 384
 args.compile = False
-args.dtype = "float32"
+args.dtype = "bfloat16"
 args.resume = True
 args.vit_folder = f"./saved_networks/ImageNet_{args.img_size}_{args.vit_size}.pth"
 
@@ -255,7 +255,7 @@ if __name__ == "__main__":
     def _sampler_ctor():
         # 与你示例保持一致，可改 step/top_k 以实验不同调度
         return HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=0, w=2,
-                             sched_pow=2, step=32, randomize=True, top_k=-1)
+                             sched_pow=2, step=32, randomize=False, top_k=-1)
 
     # 可把 sampler 的关键参数也记录进结果（可选）
     def _extra(model, sampler):
