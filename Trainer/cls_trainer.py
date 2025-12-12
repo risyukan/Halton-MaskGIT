@@ -30,7 +30,7 @@ class MaskGIT(Trainer):
         print(f"Init Cls-to-Img Maskgit on [GPU{args.global_rank}]")
 
         self.args = args                                                        # Main argument see main.py
-        self.input_size = self.args.img_size // self.args.f_factor              # Define input size for transformer
+        self.input_size = self.args.img_size // self.args.f_factor              # 定义input尺寸（VQGAN下采样后的尺寸）
 
         # Load transformer (Masked Bidirectional Transformer) and VQGAN models
         self.vit = self.get_network("vit")                                      # Load Masked Bidirectional Transformer
