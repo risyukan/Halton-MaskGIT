@@ -16,7 +16,7 @@ VIT_SIZE      = "large"        # "tiny" / "small" / "base" / "large"
 DTYPE         = "float32"      # "float32" 更稳
 COMPILE       = False
 TOME_KEEP     = 0.7            # 1.0 关闭 Token Merge；<1 开启
-NUM_SAMPLES   = 50000          # 典型为 50k；快速测试可设小一些
+NUM_SAMPLES   = 20000          # 典型为 50k；快速测试可设小一些
 BATCH_SIZE    = 32
 INCEPT_CHUNKS = 10             # MultiInceptionMetrics 的分块数
 REAL_STATS    = f"./saved_networks/ImageNet_{IMG_SIZE}_val_stats.pt"  # 真实统计路径
@@ -55,7 +55,7 @@ def load_real_stats(path):
 @torch.no_grad()  # <--- 修改 #1: 添加全局 no_grad
 def main():
     torch.manual_seed(SEED)
-    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # 载入配置并设置
     args = load_args_from_file(CONFIG_PATH)

@@ -48,7 +48,7 @@ grad_clip: 1.0            # Gradient clipping threshold
 # Sampler
 sampler: "halton"         # Type of sampler (e.g., confidence)
 temp_warmup: 0            # Temperature warmup steps
-step: 32                  # Number of sampling steps
+step: 32                 # Number of sampling steps
 top_k: -1                 # Top-k sampling (set -1 to disable)
 sched_pow: 2.0            # Scheduler increment power
 cfg_w: 3.0                # Classifier-free guidance weight
