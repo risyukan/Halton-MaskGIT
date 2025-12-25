@@ -268,7 +268,7 @@ if __name__ == "__main__":
     # ==== 配置你的实验网格 ====
     trials = 5  # 每个组合跑5次（自动丢弃第1次）
     nb_sample_list = (len(labels),)  # 或者试 (4, 8, 16)
-    tome_keep_ratio_list = (1.0, 0.75, 0.5, 0.33)
+    tome_keep_ratio_list = (1.0, 0.7)
     vit_size_list = (base_args.vit_size,)  # 先固定 ViT 尺寸；也可试 ("tiny","small","base","large")
     img_size_list = (base_args.img_size,)  # 先固定分辨率；也可试 (256, 384)
     compile_list = (False,)                # 也可试 (False, True)

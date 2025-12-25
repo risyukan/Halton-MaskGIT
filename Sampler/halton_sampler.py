@@ -97,10 +97,10 @@ class HaltonSampler(object):
             prev_r = 0
             for index in bar:
                 # Compute the number of tokens to predict
-                ratio = ((index + 1) / self.step)
-                r = 1 - (torch.arccos(torch.tensor(ratio)) / (math.pi * 0.5))
-                r = int(r * (trainer.input_size ** 2))
-                r = max(index + 1, r)
+                total = trainer.input_size ** 2
+                k = math.ceil(total / self.step)   # 每步固定 unmask k 个（最后一步可能提前到满）
+                r = min(total, (index + 1) * k)    # r 是累计 unmask 数
+                r = max(prev_r + 1, r)             # 防止某些情况下 r 不前进（保险）
 
                 # Construct the mask for the current step
                 _mask = halton_mask.clone()[:, prev_r:r]
@@ -118,12 +118,17 @@ class HaltonSampler(object):
                     with trainer.autocast:
                         logit = trainer.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                             torch.cat([labels, labels], dim=0),
-                                            torch.cat([~drop, drop], dim=0))
+                                            torch.cat([~drop, drop], dim=0),
+                                            step_idx=index,
+                                            num_steps=self.step)
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     logit = (1 + self.w) * logit_c - self.w * logit_u
                 else:
                     with trainer.autocast:
-                        logit = trainer.vit(code.clone(), labels, ~drop)
+                        logit = trainer.vit(code.clone(), labels, ~drop,
+                                            step_idx=index,
+                                            num_steps=self.step)
+
 
                 # Compute probabilities using softmax
                 prob = torch.softmax(logit * _temp, -1)

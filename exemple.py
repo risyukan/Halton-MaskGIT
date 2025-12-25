@@ -20,7 +20,7 @@ args.compile = False
 args.dtype = "float32"
 args.resume = True
 args.vit_folder = f"./saved_networks/ImageNet_{args.img_size}_{args.vit_size}.pth"
-args.tome_keep_ratio = 1.0      # Halton-Token-Merge 保留比例，1.0 表示关闭
+args.tome_keep_ratio = 0.7     # Halton-Token-Merge 保留比例，1.0 表示关闭
 
 # Download the MaskGIT
 hf_hub_download(repo_id="llvictorll/Halton-Maskgit",
@@ -38,7 +38,7 @@ model = MaskGIT(args)
 
 # select your scheduler (Halton is better)
 sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=0, w=2,
-                        sched_pow=2, step=32, randomize=True, top_k=-1)
+                        sched_pow=2, step=12, randomize=True, top_k=-1)
 
 # [goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear]
 labels = torch.LongTensor([1, 7, 282, 604, 724, 179, 681, 850]).to(args.device)

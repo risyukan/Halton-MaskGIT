@@ -25,42 +25,36 @@ def modulate(x, shift, scale):
 # ========= Halton-ToMe helpers =========
 def _halton_centers_and_assignments_sq(h_or_w: int, num_centers: int, device):
     """
-    使用 HaltonSampler.build_halton_mask(h) 生成 [N,2] (y,x) 样本点，
-    前 num_centers 个作为中心，其余 token 依据 2D 欧氏距离分配到最近中心。
-    仅支持正方形网格 (h==w) 的场景；N = h*h。
-    返回:
-      centers_yx: [M,2]
-      cluster_ids: [N] 中每个 token 的簇 id (0..M-1)
-      counts: [M] 每个簇的成员数
+    返回一个 builder：builder(M_, start=0) -> (centers_yx, cluster_ids, counts)
+    - centers 从 Halton 序列 [start : start+M_] 取（越界则 wrap）
+    - cluster_ids: [N] 每个 token 分配到最近中心
     """
     N = h_or_w * h_or_w
-    # 总的 token 数
-    M = max(1, int(round(N * 1.0)))  # 默认先占位，实际由外层控制 keep_ratio 决定
-    # 这里仅生成 Halton mask，真正的 M 在外部生效
-    # 确保至少是 1，避免出现 M = 0 的情况
     halton_mask = HaltonSampler.build_halton_mask(h_or_w).to(device)  # [N,2] (y,x)
 
-    def _build_with_M(M_): # M_ 保留的中心数
-        centers_yx = halton_mask[:M_].to(device)               # [M,2]
-        # 取前 M 个作为中心
-        yy, xx = torch.meshgrid(
-            torch.arange(h_or_w, device=device),
-            torch.arange(h_or_w, device=device),
-            indexing="ij"
-        )
-        coords = torch.stack([yy, xx], dim=-1).reshape(-1, 2).float()  # [N,2]
-        # 计算 N×M 距离并找最近中心
-        dist = torch.cdist(coords, centers_yx.float(), p=2)             # [N,M]
-        # torch.cdist 计算两两之间的距离。
-        # 得到一个 [N, M] 的矩阵：第 i 行表示第 i 个 token 到所有 M 个中心的距离。
-        cluster_ids = dist.argmin(dim=1)                                 # [N]
-        # cluster_ids 的形状是 [N]，每个元素是 0..M_-1 之间的整数，代表 token 属于哪个簇
-        counts = torch.bincount(cluster_ids, minlength=M_).clamp_min(1) # [M]
-        # counts 的形状是 [M]，每个元素表示对应簇的成员数量，确保最少为 1
+    # 预先建好网格坐标，避免每次重复建
+    yy, xx = torch.meshgrid(
+        torch.arange(h_or_w, device=device),
+        torch.arange(h_or_w, device=device),
+        indexing="ij"
+    )
+    coords = torch.stack([yy, xx], dim=-1).reshape(-1, 2).float()  # [N,2]
+
+    def _build_with_M(M_: int, start: int = 0):
+        M_ = max(1, int(M_))
+        start = int(start) % N
+
+        # 取连续 M 个中心，越界 wrap
+        end = start + M_
+        if end <= N:
+            centers_yx = halton_mask[start:end]
+        else:
+            centers_yx = torch.cat([halton_mask[start:], halton_mask[:end - N]], dim=0)
+
+        dist = torch.cdist(coords, centers_yx.float(), p=2)           # [N,M]
+        cluster_ids = dist.argmin(dim=1)                              # [N]
+        counts = torch.bincount(cluster_ids, minlength=M_).clamp_min(1)  # [M]
         return centers_yx, cluster_ids, counts
-        # centers_yx：中心坐标（形状 [M, 2]，比如 (y, x)）。
-        # cluster_ids：每个 token 的簇 ID（形状 [N]）。
-        # counts：每个簇的 token 数（形状 [M]，不会小于 1）。
 
     return _build_with_M
     # 用法：build = _halton_centers_and_assignments_sq(h, None, device); centers, ids, cnt = build(M)
@@ -319,7 +313,7 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None):
+    def forward(self, x, y, drop_label, mask=None, step_idx: int = 0, num_steps: int = 1):
         b, h, w = x.size()
         x = x.reshape(b, h * w)
 
@@ -353,28 +347,36 @@ class Transformer(nn.Module):
         # 构建合并后的输入序列 x_for_blocks，以及为反合并准备的映射
         tome_ctx = None
         if use_tome:
-            # 计算 M（合并后保留的 token 数）
-            M = max(1, int(round(N * self.tome_keep_ratio)))
+            # ===== step-based Halton centers =====
+            # 每一步使用 M = ceil(N / num_steps) 个中心
+            M = max(1, int(math.ceil(N / max(1, int(num_steps)))))
+            # step 对应的 Halton 段起点（连续取 M 个，越界 wrap）
+            start = (int(step_idx) % max(1, int(num_steps))) * M
+            start = start % N
 
-            # 取/建缓存
-            key = (h, w, M, x.device.type)
+            # 缓存 key 需要包含 start，否则每一步中心不同
+            key = (h, w, M, start, x.device.type)
+
             if key not in self._tome_cache:
-                # 仅支持正方形网格；如果将来 h!=w，需要相应修改为长方形 Halton
                 assert h == w, f"Halton-ToMe 当前实现仅支持正方形网格，got h={h}, w={w}"
                 builder = _halton_centers_and_assignments_sq(h, M, x.device)
-                centers, cluster_ids, counts = builder(M)
+                centers, cluster_ids, counts = builder(M, start=start)
+
+                # 可选随机 roll（保留你原来的开关）
                 if self.tome_random_roll:
-                    # 可选：对 halton 序列整体 roll，做一点随机性
                     shift = torch.randint(0, N, (1,), device=x.device).item()
                     order = torch.arange(N, device=x.device)
                     cluster_ids = cluster_ids[order.roll(shifts=shift)]
+
                 self._tome_cache[key] = {
-                    "centers": centers,            # [M,2] 目前没直接用到，但保留
-                    "ids": cluster_ids,            # [N]
-                    "counts": counts               # [M]
+                    "centers": centers,
+                    "ids": cluster_ids,
+                    "counts": counts
                 }
+
             ids = self._tome_cache[key]["ids"]
             counts = self._tome_cache[key]["counts"]
+
 
             # 只合并空间 token
             x_sp = x[:, :N, :]                                # [B,N,C]
