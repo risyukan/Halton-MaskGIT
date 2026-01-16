@@ -19,12 +19,12 @@ class HaltonSampler(object):
         params:
             sm_temp_min  -> float: Minimum softmax temperature.
             sm_temp_max  -> float: Maximum softmax temperature.
-            temp_pow     -> float: Exponent for temperature scheduling.
+            temp_pow     -> float: Exponent for temperature scheduling.等于1时，温度随步数线性（Linear）变化。步数走过一半，温度也正好变化到一半
             w            -> float: Weight parameter for the CFG.
             sched_pow    -> float: Exponent for mask scheduling.
             step         -> int: Number of steps in the sampling process.
             randomize    -> bool: Whether to randomize the Halton sequence for the generation.
-            top_k        -> int: If > 0, applies top-k sampling for token selection.
+            top_k        -> int: If > 0, applies top-k sampling for token selection. -1表示禁用 Top-k 过滤，即使用全概率分布进行采样。
             temp_warmup  -> int: Number of initial steps where temperature is reduced.
         """
         super().__init__()
@@ -62,25 +62,29 @@ class HaltonSampler(object):
             Tuple: Generated images, list of intermediate codes, list of masks used during generation.
         """
 
-        # Build the Halton mask if not already created
+        # 如果还没有生成 Halton 掩码，则调用静态方法生成一个覆盖全图的采样顺序表
         if self.basic_halton_mask is None:
             self.basic_halton_mask = self.build_halton_mask(trainer.input_size)
 
         trainer.vit.eval()
-        l_codes = []  # List to store intermediate latent codes
-        l_mask = []  # Save the intermediate masks
+        l_codes = []  # 记录每一轮迭代后模型预测出的图像 Token
+        l_mask = []  # 记录每一轮迭代时，哪些位置被选中并进行了更新（即当前的掩码状态）
         with torch.no_grad():
             if labels is None:  # Default classes generated
                 # goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear, random
                 labels = [1, 7, 282, 604, 724, 179, 751, 404, 850] + [random.randint(0, 999) for _ in range(nb_sample - 9)]
+                # 如果你要生成的图片数量（nb_sample）超过了这 9 个固定类别，剩下的会用 random.randint(0, 999) 随机抽取类别填充
                 labels = torch.LongTensor(labels[:nb_sample]).to(trainer.args.device)
+                # 将列表转换为 PyTorch 的长整型张量（LongTensor），并移动到 GPU上便于计算
 
             drop = torch.ones(nb_sample, dtype=torch.bool).to(trainer.args.device)
+            # 创建一个全为 True（1）的布尔张量，长度等于要生成的图片数量
             if init_code is not None:  # Start with a pre-define code
                 code = init_code
             else:  # Initialize a code
                 code = torch.full((nb_sample, trainer.input_size, trainer.input_size),
                                   trainer.args.mask_value).to(trainer.args.device)
+                # torch.full创建一个指定形状的矩阵，并填满同一个值mask_value。mask_value是一个大于codebook的值16384，表示这些位置的 Token 目前是“未知”或“需要预测”的状态
 
             # Randomizing the mask sequence if enabled
             if self.randomize:
@@ -91,23 +95,35 @@ class HaltonSampler(object):
                     halton_mask[i_h] = rand_halton
             else:
                 halton_mask = self.basic_halton_mask.clone().unsqueeze(0).expand(nb_sample, trainer.input_size ** 2, 2)
+                # [L, 2]到[1, L, 2]，再扩展到[N, L, 2]，L = input_size**2
 
             # Softmax temperature
             bar = tqdm(range(self.step), leave=False) if verbose else range(self.step)
-            prev_r = 0
+            # leave=False: 这是一个 UI 细节。表示当这个循环结束（图像生成完）时，进度条会自动从屏幕上消失，不会留下杂乱的日志
+            # 只有在 verbose=True 时，才会显示进度条
+            prev_r = 0 # 掩码比例（Ratio）的起点
             for index in bar:
                 # Compute the number of tokens to predict
                 ratio = ((index + 1) / self.step)
                 r = 1 - (torch.arccos(torch.tensor(ratio)) / (math.pi * 0.5))
                 r = int(r * (trainer.input_size ** 2))
                 r = max(index + 1, r)
+                # 确保在任何情况下，当前步解开的 Token 数量 r 至少要等于当前步数，保证每一步至少解开一个新的 Token
 
                 # Construct the mask for the current step
                 _mask = halton_mask.clone()[:, prev_r:r]
+                # _mask 包含了当前步需要被unmask的像素坐标，形状为 (样本数, 当前步需解码的Token数, 2)。左闭右开区间
                 mask = torch.zeros(nb_sample, trainer.input_size, trainer.input_size, dtype=torch.long)
-                for i_mask in range(nb_sample):
-                    mask[i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]] = 1
-                mask = mask.bool()
+                # 创建一个形状为 (样本数, 图像高度, 图像宽度) 的三维张量，初始值全为0
+                for i_mask in range(nb_sample): #也可以把这个循环改成向量化操作
+                    mask[i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]] = 1 #i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]都是二维索引，可以更快一点
+                    # _mask[i_mask, :, 0]：取第i个样本在当前步的所有 x坐标。
+                    # _mask[i_mask, :, 1]：取第i个样本在当前步的所有 y坐标。
+                    # 这里的xy可能写反了，但是不影响正方形图像生成
+                mask = mask.bool() # 增量掩码，形状: [nb_sample, input_size, input_size]，True表示该位置在当前step需要被预测
+
+                is_masked = (code == trainer.args.mask_value) # 找出当前 code 中哪些位置仍然是未预测的（即等于 mask_value 的位置）
+
 
                 # Choose softmax temperature
                 _temp = self.temperature[index] ** self.temp_pow
@@ -118,34 +134,54 @@ class HaltonSampler(object):
                     with trainer.autocast:
                         logit = trainer.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                             torch.cat([labels, labels], dim=0),
-                                            torch.cat([~drop, drop], dim=0))
+                                            torch.cat([~drop, drop], dim=0),
+                                            global_masked_token = torch.cat([is_masked, is_masked], dim=0),# 传入模型的全局掩码，告诉模型哪些位置是被mask的
+                                            current_mask = torch.cat([mask, mask], dim=0)# 传入模型的当前掩码，告诉模型哪些位置是本step需要预测的
+                                            )
+                    # 传到transformer的forward里
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
+                    # 将模型输出的结果从中间切开，重新分成有条件的 logit_c 和无条件的 logit_u
                     logit = (1 + self.w) * logit_c - self.w * logit_u
+                    # logit形状: [nb_sample, input_size**2, codebook_size]
                 else:
                     with trainer.autocast:
                         logit = trainer.vit(code.clone(), labels, ~drop)
+                        # ~drop是False代表不丢弃标签
 
                 # Compute probabilities using softmax
                 prob = torch.softmax(logit * _temp, -1)
+                # 将logit乘以温度_temp后再做softmax，得到每个位置上每个token的概率分布
+                # 形状: [nb_sample, input_size**2, codebook_size]
+
                 if self.top_k > 0:# Apply top-k filtering
                     top_k_probs, top_k_indices = torch.topk(prob, self.top_k)
                     top_k_probs /= top_k_probs.sum(dim=-1, keepdim=True)
-                    next_token_index = torch.multinomial(top_k_probs.view(-1, self.top_k), num_samples=1)
+                    # 归一化：因为我们只取了前 K 个，它们的概率和不再是 1。为了后续采样，必须通过除以它们的总和，把这 K个点的概率重新拉回到 [0, 1]$范围内
+                    next_token_index = torch.multinomial(top_k_probs.view(-1, self.top_k), num_samples=1)#从可能性中随机抽取
                     pred_code = top_k_indices.gather(-1, next_token_index.view(nb_sample, trainer.input_size ** 2, 1))
+                    # 根据 next_token_index 提供的相对位置，去 top_k_indices 里把那个真正的“全局身份证号”取出来
                 else:
                     # Sample from the categorical distribution
                     pred_code = torch.distributions.Categorical(probs=prob).sample()
+                    # 形状: [nb_sample, input_size**2]，存储token ID
 
                 # Update code with new predictions
                 code[mask] = pred_code.view(nb_sample, trainer.input_size, trainer.input_size)[mask]
+                # code形状: [nb_sample, input_size, input_size]
 
                 l_codes.append(pred_code.view(nb_sample, trainer.input_size, trainer.input_size).clone())
+                # 记录了每一轮迭代预测出的完整token id图
                 l_mask.append(mask.view(nb_sample, trainer.input_size, trainer.input_size).clone().float())
+                # 记录了每一轮使用的掩码分布。float()转换是为了后续可视化方便，True变1.0，False变0.0
                 prev_r = r
+                # 通过将 r（当前步的终点）赋值给 prev_r（下一步的起点），确保了在下一轮迭代中，切片操作会从正确的位置开始，不会重复处理已经预测过的 Halton 坐标。
             # Decode the final prediction
             code = torch.clamp(code, 0, trainer.args.codebook_size - 1)
+            # clamp确保所有token id都在0到codebook_size-1之间。形状: [nb_sample, input_size, input_size]
             x = trainer.ae.decode_code(code)
+            # 通过自动编码器的解码器部分，将最终预测得到的离散 token id 图转换回连续的图像像素空间
             x = torch.clamp(x, -1, 1)
+            # 将图像像素值限制在 -1 到 1 之间，确保输出图像的像素值在合理范围内
 
         trainer.vit.train()  # Restore training mode
         return x, l_codes, l_mask

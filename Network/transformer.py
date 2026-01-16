@@ -319,119 +319,44 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None):
+    def forward(self, x, y, drop_label, mask=None,global_masked_token=None,current_mask=None): #x是code，y是class label，drop_label是bool值
         b, h, w = x.size()
-        x = x.reshape(b, h * w)
+        x = x.reshape(b, h*w)
+        # 
 
         # Drop the label if drop_label
         y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
         y = self.cls_emb(y)
 
-        # 位置编码（按原样）
-        pos = torch.arange(0, w * h, dtype=torch.long, device=x.device)
+        pos = torch.arange(0, w*h, dtype=torch.long, device=x.device)
         pos = self.pos_emb(pos)
 
-        x = self.tok_emb(x) + pos  # [B, N, C], N=h*w
+        x = self.tok_emb(x) + pos
 
-        # optional 下采样 patchify
+        # reshape, proj to smaller space, reshape (patchify!)
         if self.proj > 1:
             x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
-            x = self.in_proj(x)  # stride=2
+            x = self.in_proj(x)
             _, _, h, w = x.shape
-            x = rearrange(x, 'b c h w -> b (h w) c', b=b, c=self.hidden_dim, h=h, w=w).contiguous()
+            x = rearrange(x, 'b c h proj_w -> b (h proj_w) c', proj_h=h, proj_w=w, b=b, c=self.hidden_dim).contiguous()
 
-        # ===== 这里开始：准备 register token，并在进入 blocks 前做 ToMe 合并 =====
-        reg_tok = None
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
-            reg_tok = self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)  # [B,R,C]
-            # 注意：合并只对空间 token 生效，register 不参与合并
+            x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        N = h * w  # 空间 token 数
-        use_tome = (self.tome_keep_ratio is not None) and (self.tome_keep_ratio < 1.0) and (N > 0)
+        x = self.transformer(x, y, mask=mask)
 
-        # 构建合并后的输入序列 x_for_blocks，以及为反合并准备的映射
-        tome_ctx = None
-        if use_tome:
-            # 计算 M（合并后保留的 token 数）
-            M = max(1, int(round(N * self.tome_keep_ratio)))
+        # drop the register
+        x = x[:, :h*w].contiguous()
 
-            # 取/建缓存
-            key = (h, w, M, x.device.type)
-            if key not in self._tome_cache:
-                # 仅支持正方形网格；如果将来 h!=w，需要相应修改为长方形 Halton
-                assert h == w, f"Halton-ToMe 当前实现仅支持正方形网格，got h={h}, w={w}"
-                builder = _halton_centers_and_assignments_sq(h, M, x.device)
-                centers, cluster_ids, counts = builder(M)
-                if self.tome_random_roll:
-                    # 可选：对 halton 序列整体 roll，做一点随机性
-                    shift = torch.randint(0, N, (1,), device=x.device).item()
-                    order = torch.arange(N, device=x.device)
-                    cluster_ids = cluster_ids[order.roll(shifts=shift)]
-                self._tome_cache[key] = {
-                    "centers": centers,            # [M,2] 目前没直接用到，但保留
-                    "ids": cluster_ids,            # [N]
-                    "counts": counts               # [M]
-                }
-            ids = self._tome_cache[key]["ids"]
-            counts = self._tome_cache[key]["counts"]
-
-            # 只合并空间 token
-            x_sp = x[:, :N, :]                                # [B,N,C]
-            x_sp_m = _merge_tokens_spatial(x_sp, ids, counts) # [B,M,C]
-
-            # 与 register token 重新拼接得到进入 blocks 的序列
-            if reg_tok is not None:
-                x_for_blocks = torch.cat([x_sp_m, reg_tok], dim=1)   # [B, M+R, C]
-            else:
-                x_for_blocks = x_sp_m                                 # [B, M, C]
-
-            tome_ctx = {
-                "ids": ids, "counts": counts, "N": N, "M": M, "has_reg": reg_tok is not None
-            }
-        else:
-            # 不启用合并：保持原样
-            x_for_blocks = torch.cat([x, reg_tok], dim=1) if reg_tok is not None else x
-
-        # ======= 进入 Transformer blocks：第 1 层前已合并；最后一层前反合并 =======
-        L = len(self.transformer.layers)
-        unmerge_before = self.tome_unmerge_before_idx if self.tome_unmerge_before_idx >= 0 else (L - 1)
-
-        for i, block in enumerate(self.transformer.layers):
-            # 在最后一层 block 之前把 token 反合并回原始长度（仅当启用 ToMe）
-            if use_tome and i == unmerge_before:
-                if tome_ctx["has_reg"]:
-                    x_sp_m, x_reg = x_for_blocks[:, :tome_ctx["M"], :], x_for_blocks[:, tome_ctx["M"]:, :]
-                else:
-                    x_sp_m, x_reg = x_for_blocks, None
-
-                x_sp_full = _unmerge_tokens_spatial(x_sp_m, tome_ctx["ids"])  # [B,N,C]
-
-                x_for_blocks = torch.cat([x_sp_full, x_reg], dim=1) if x_reg is not None else x_sp_full
-                # 注意：反合并后，后续 block（也就是最后一个 block）将对“完整长度”的序列计算
-
-            # 关于 mask：
-            #   合并阶段（前 L-1 层）序列长度变化，mask 需要同步聚合；若你的训练里不依赖 mask，推荐传 None。
-            #   最后一层已反合并，我们把原 mask 直接传给最后一层（如果你需要）。
-            if (use_tome and i < unmerge_before):
-                x_for_blocks = block(x_for_blocks, y, mask=None)
-            else:
-                x_for_blocks = block(x_for_blocks, y, mask=mask)
-
-        x = x_for_blocks  # [B, (N或M)+R, C]，取决于最后是否已反合并
-
-        # 去掉 register，仅保留空间 token（此时若启用 ToMe，已反合并回 N）
-        x = x[:, :h * w].contiguous()
-
-        # optional 上采样还原 token 网格（按你原逻辑）
         if self.proj > 1:
             x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
             x = self.out_proj(x)
-            x = rearrange(x, 'b (c s1 s2) h w -> b (h s1 w s2) c',
-                          s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim).contiguous()
+            x = rearrange(x, 'b (c s1 s2) h w -> b (h s1 w s2) c', s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim).contiguous()
 
         x = self.last_norm(x, y)
         logit = self.head(x)
+
         return logit
 
 
