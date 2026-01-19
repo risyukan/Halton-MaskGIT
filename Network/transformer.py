@@ -320,13 +320,19 @@ class Transformer(nn.Module):
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
     def forward(self, x, y, drop_label, mask=None,global_masked_token=None,current_mask=None): #x是code，y是class label，drop_label是bool值
+        # global_masked_token形状是 [batch, input_size, input_size] 的布尔张量，表示当前整幅图里哪些 token 还没被预测（全局未解码的位置）
+        # current_mask 形状是 [nb_sample, input_size, input_size]，True 代表这一轮要更新的token。
         b, h, w = x.size()
         x = x.reshape(b, h*w)
-        # 
+        # x: [b, h*w]
 
         # Drop the label if drop_label
         y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
+        # torch.full_like,创建一个和 y 形状一样的新张量，里面填满的值是 self.nclass,y是传入的类别标签张量
+        # 如果 drop_label 为 True，就把 y 替换成全是 self.nclass 的张量，表示“无类别”。
+        # y: [b]
         y = self.cls_emb(y)
+        # 把类别标签 y 通过 cls_emb 嵌入成向量表示，形状变成 [b, hidden_dim]
 
         pos = torch.arange(0, w*h, dtype=torch.long, device=x.device)
         pos = self.pos_emb(pos)

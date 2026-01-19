@@ -76,6 +76,7 @@ class HaltonSampler(object):
                 # 如果你要生成的图片数量（nb_sample）超过了这 9 个固定类别，剩下的会用 random.randint(0, 999) 随机抽取类别填充
                 labels = torch.LongTensor(labels[:nb_sample]).to(trainer.args.device)
                 # 将列表转换为 PyTorch 的长整型张量（LongTensor），并移动到 GPU上便于计算
+                # labels形状: [nb_sample]
 
             drop = torch.ones(nb_sample, dtype=torch.bool).to(trainer.args.device)
             # 创建一个全为 True（1）的布尔张量，长度等于要生成的图片数量
