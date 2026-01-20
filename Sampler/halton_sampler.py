@@ -117,7 +117,7 @@ class HaltonSampler(object):
                 mask = torch.zeros(nb_sample, trainer.input_size, trainer.input_size, dtype=torch.long)
                 # 创建一个形状为 (样本数, 图像高度, 图像宽度) 的三维张量，初始值全为0
                 for i_mask in range(nb_sample): #也可以把这个循环改成向量化操作
-                    mask[i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]] = 1 #i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]都是二维索引，可以更快一点
+                    mask[i_mask, _mask[i_mask, :, 1], _mask[i_mask, :, 0]] = 1 #i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]都是二维索引，可以更快一点
                     # _mask[i_mask, :, 0]：取第i个样本在当前步的所有 x坐标。
                     # _mask[i_mask, :, 1]：取第i个样本在当前步的所有 y坐标。
                     # 这里的xy可能写反了，但是不影响正方形图像生成
@@ -133,10 +133,11 @@ class HaltonSampler(object):
 
                 if self.w != 0: # Model Prediction with cfg
                     with trainer.autocast:
+                        global_masked_token = torch.cat([is_masked, is_masked], dim=0) if (index >= 9 and index <=19) else None
                         logit = trainer.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                             torch.cat([labels, labels], dim=0),
                                             torch.cat([~drop, drop], dim=0),
-                                            global_masked_token = torch.cat([is_masked, is_masked], dim=0),# 传入模型的全局掩码，告诉模型哪些位置是被mask的
+                                            global_masked_token = global_masked_token,# 传入模型的全局掩码，告诉模型哪些位置是被mask的
                                             current_mask = torch.cat([mask, mask], dim=0)# 传入模型的当前掩码，告诉模型哪些位置是本step需要预测的
                                             )
                     # 传到transformer的forward里

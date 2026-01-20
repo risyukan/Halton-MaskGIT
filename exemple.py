@@ -38,7 +38,7 @@ model = MaskGIT(args)
 
 # select your scheduler (Halton is better)
 sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=0, w=2,
-                        sched_pow=2, step=32, randomize=True, top_k=-1)
+                        sched_pow=2, step=32, randomize=False, top_k=-1)
 
 # [goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear]
 labels = torch.LongTensor([1, 7, 282, 604, 724, 179, 681, 850]).to(args.device)

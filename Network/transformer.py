@@ -339,26 +339,91 @@ class Transformer(nn.Module):
 
         x = self.tok_emb(x) + pos
 
-        # reshape, proj to smaller space, reshape (patchify!)
-        if self.proj > 1:
-            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
-            x = self.in_proj(x)
-            _, _, h, w = x.shape
-            x = rearrange(x, 'b c h proj_w -> b (h proj_w) c', proj_h=h, proj_w=w, b=b, c=self.hidden_dim).contiguous()
+        merge_info = None
+        if global_masked_token is not None and current_mask is not None:
+            gm = global_masked_token.to(x.device).bool()
+            cm = current_mask.to(x.device).bool()
+            gm_flat = gm.view(b, -1)
+            cm_flat = cm.view(b, -1)
+
+            yy, xx = torch.meshgrid(
+                torch.arange(h, device=x.device),
+                torch.arange(w, device=x.device),
+                indexing="ij"
+            )
+            coords = torch.stack([yy, xx], dim=-1).reshape(-1, 2).float()
+
+            merged_batches, clusters, sizes, max_tokens = [], [], [], 0
+            for i in range(b):
+                masked_idx = torch.nonzero(gm_flat[i] & ~cm_flat[i], as_tuple=False).squeeze(-1)
+                center_idx = torch.nonzero(cm_flat[i], as_tuple=False).squeeze(-1)
+                keep_idx = torch.nonzero(~gm_flat[i], as_tuple=False).squeeze(-1)
+
+                if center_idx.numel() == 0:
+                    cluster_ids = torch.arange(h * w, device=x.device)
+                    counts = torch.ones(h * w, device=x.device, dtype=torch.long)
+                    merged_batches.append(x[i:i+1])
+                    clusters.append(cluster_ids)
+                    sizes.append(h * w)
+                    max_tokens = max(max_tokens, h * w)
+                    continue
+
+                cluster_ids = torch.empty(h * w, device=x.device, dtype=torch.long)
+                # 已解码 token 保持独立
+                cluster_ids[keep_idx] = torch.arange(keep_idx.numel(), device=x.device)
+                offset = keep_idx.numel()
+                # 当前步中心
+                cluster_ids[center_idx] = torch.arange(center_idx.numel(), device=x.device) + offset
+
+                if masked_idx.numel() > 0:
+                    dist = torch.cdist(coords[masked_idx], coords[center_idx], p=2)
+                    nearest = dist.argmin(dim=1) + offset
+                    cluster_ids[masked_idx] = nearest
+
+                counts = torch.bincount(cluster_ids, minlength=offset + center_idx.numel()).clamp_min(1)
+                merged_batches.append(_merge_tokens_spatial(x[i:i+1], cluster_ids, counts))
+                clusters.append(cluster_ids)
+                sizes.append(counts.numel())
+                max_tokens = max(max_tokens, counts.numel())
+
+            # === no padding version (Halton: same merged length across batch) ===
+            L_merge = merged_batches[0].shape[1]
+            # 可选：调试断言，确保确实一致
+            for i, merged in enumerate(merged_batches):
+                assert merged.shape[1] == L_merge, f"merged length mismatch at {i}: {merged.shape[1]} vs {L_merge}"
+
+            # merged_batches 里每个是 [1, L_merge, hidden_dim]，直接 cat 成 [b, L_merge, hidden_dim]
+            x = torch.cat(merged_batches, dim=0)
+
+            # 不再需要 pad_mask
+            merge_info = {"clusters": clusters, "sizes": sizes}  # sizes 仍然保留给 unmerge 用
+
+
+        base_seq_len = x.shape[1]
+        # 没有 padding 了：如果你原本 mask 只是 padding mask，那这里直接用 None 即可；
+        # 但为了兼容你外部可能传入的 mask，最安全是继续用传进来的 mask
+        attn_mask = mask
+
 
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
             x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
+            if attn_mask is not None:
+                reg_mask = torch.zeros(b, self.register, device=x.device, dtype=attn_mask.dtype)
+                attn_mask = torch.cat([attn_mask, reg_mask], dim=1)
 
-        x = self.transformer(x, y, mask=mask)
+        x = self.transformer(x, y, mask=attn_mask)
 
         # drop the register
-        x = x[:, :h*w].contiguous()
+        x = x[:, :base_seq_len].contiguous()
 
-        if self.proj > 1:
-            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
-            x = self.out_proj(x)
-            x = rearrange(x, 'b (c s1 s2) h w -> b (h s1 w s2) c', s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim).contiguous()
+        if merge_info is not None:
+            recovered = x.new_zeros(b, h * w, self.hidden_dim)
+            for i, cluster_ids in enumerate(merge_info["clusters"]):
+                recovered[i:i+1] = _unmerge_tokens_spatial(x[i:i+1, :merge_info["sizes"][i]], cluster_ids)
+            x = recovered
+        else:
+            x = x[:, :h*w].contiguous()
 
         x = self.last_norm(x, y)
         logit = self.head(x)

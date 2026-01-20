@@ -95,16 +95,7 @@ class MaskGIT(Trainer):
                 input_size=self.input_size, nclass=self.args.nb_class, c=hidden_dim,
                 hidden_dim=hidden_dim, codebook_size=self.args.codebook_size,
                 depth=depth, heads=heads, mlp_dim=hidden_dim * 4, dropout=self.args.dropout,
-                register=self.args.register, proj=self.args.proj, 
-                    # === 新增：Halton-Token-Merge 开关与配置 ===
-                # 1.0 = 关闭合并；例如 0.5 表示只保留一半 token（第1层前合并、最后一层前反合并）
-                tome_keep_ratio=self.args.tome_keep_ratio,
-                # 在第几层前合并；按你实现，0 就是“第一层前”
-                tome_merge_layer_idx=self.args.tome_merge_layer_idx,
-                # 在倒数第1层前反合并；-1 就是“最后一层前”
-                tome_unmerge_before_idx=self.args.tome_unmerge_before_idx,
-                # 如需为每个前向随机 roll 一下 Halton 次序（增强/去同质化），就传 True
-                tome_random_roll=self.args.tome_random_roll,)
+                register=self.args.register, proj=self.args.proj, )
 
             # Load model checkpoint if resuming training
             if self.args.resume:
