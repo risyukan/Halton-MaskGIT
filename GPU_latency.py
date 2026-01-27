@@ -1,0 +1,95 @@
+import torch
+from Utils.utils import load_args_from_file
+from Utils.viz import show_images_grid
+from huggingface_hub import hf_hub_download
+
+from Trainer.cls_trainer import MaskGIT
+from Sampler.halton_sampler import HaltonSampler
+
+
+config_path = "Config/base_cls2img.yaml"        # Path to your config file
+args = load_args_from_file(config_path)
+
+# Update arguments
+args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Select Network (Large 384 is the best, but the slowest)
+args.vit_size = "large"  # "tiny", "small", "base", "large"
+args.img_size = 384  # 256 or 384
+args.compile = False
+args.dtype = "float32"
+args.resume = True
+args.vit_folder = f"./saved_networks/ImageNet_{args.img_size}_{args.vit_size}.pth"
+args.tome_keep_ratio = 1.0      # Halton-Token-Merge 保留比例，1.0 表示关闭
+
+# Download the MaskGIT
+hf_hub_download(repo_id="llvictorll/Halton-Maskgit",
+                filename=f"ImageNet_{args.img_size}_{args.vit_size}.pth",
+                local_dir="./saved_networks")
+
+# Download VQGAN
+hf_hub_download(repo_id="FoundationVision/LlamaGen",
+                filename="vq_ds16_c2i.pt",
+                local_dir="./saved_networks")
+
+
+# Initialisation of the model
+model = MaskGIT(args)
+
+# select your scheduler (Halton is better)
+sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=0, w=2,
+                        sched_pow=2, step=32, randomize=False, top_k=-1)
+
+# [goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear]
+labels = torch.LongTensor([1, 7, 282, 604, 724, 179, 681, 850]).to(args.device)
+
+gen_images = sampler(trainer=model, nb_sample=8, labels=labels, verbose=True)[0]
+print(f"正在 {args.device} 上进行预热 (Warm-up)...")
+with torch.no_grad():
+    _ = sampler(trainer=model, nb_sample=8, labels=labels, verbose=False)
+
+# ------------------------------------------------------------------
+# 第二步：计算 Latency (延迟)
+# ------------------------------------------------------------------
+print(f"开始测量 {args.device} 延迟...")
+
+# 如果使用 GPU，必须同步 CUDA 或者是使用 torch.cuda.Event (更推荐 Event)
+if args.device.type == 'cuda':
+    torch.cuda.synchronize()  # 等待所有之前的 GPU 任务完成
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
+    
+    # === 核心生成代码 ===
+    with torch.no_grad():
+        gen_images = sampler(trainer=model, nb_sample=8, labels=labels, verbose=True)[0]
+    # ==================
+    
+    end_event.record()
+    torch.cuda.synchronize()  # 等待生成任务完成
+    
+    # 计算时间 (torch.cuda.Event 返回的是毫秒，需要除以 1000 转换为秒)
+    latency_seconds = start_event.elapsed_time(end_event) / 1000.0
+
+else:
+    # CPU 计时逻辑
+    start_time = time.time()
+    
+    # === 核心生成代码 ===
+    with torch.no_grad():
+        gen_images = sampler(trainer=model, nb_sample=8, labels=labels, verbose=True)[0]
+    # ==================
+    
+    end_time = time.time()
+    latency_seconds = end_time - start_time
+
+# ------------------------------------------------------------------
+# 第三步：输出结果
+# ------------------------------------------------------------------
+print("-" * 30)
+print(f"设备 (Device): {args.device}")
+print(f"批量大小 (Batch Size): 8")
+print(f"总延迟 (Total Latency): {latency_seconds:.4f} s")
+print(f"单张图片延迟 (Per Image): {latency_seconds / 8:.4f} s")
+print("-" * 30)

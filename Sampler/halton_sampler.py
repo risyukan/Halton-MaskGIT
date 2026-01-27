@@ -133,13 +133,19 @@ class HaltonSampler(object):
 
                 if self.w != 0: # Model Prediction with cfg
                     with trainer.autocast:
-                        global_masked_token = torch.cat([is_masked, is_masked], dim=0) if (index >= 9 and index <=19) else None
+                        global_masked_token = torch.cat([is_masked, is_masked], dim=0) if (index >=9 and index <=19) else None
                         logit = trainer.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                             torch.cat([labels, labels], dim=0),
                                             torch.cat([~drop, drop], dim=0),
                                             global_masked_token = global_masked_token,# 传入模型的全局掩码，告诉模型哪些位置是被mask的
                                             current_mask = torch.cat([mask, mask], dim=0)# 传入模型的当前掩码，告诉模型哪些位置是本step需要预测的
                                             )
+                        # ==== DEBUG: check logit vocab size ====
+                        if index == 0:  # 只打印一次，避免刷屏
+                            print("[DEBUG] logit.shape =", tuple(logit.shape))
+                            print("[DEBUG] codebook_size =", trainer.args.codebook_size,
+                                "mask_value =", trainer.args.mask_value)
+
                     # 传到transformer的forward里
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     # 将模型输出的结果从中间切开，重新分成有条件的 logit_c 和无条件的 logit_u
@@ -149,7 +155,8 @@ class HaltonSampler(object):
                     with trainer.autocast:
                         logit = trainer.vit(code.clone(), labels, ~drop)
                         # ~drop是False代表不丢弃标签
-
+                mask_id = trainer.args.mask_value                
+                logit[..., mask_id] = -float("inf") 
                 # Compute probabilities using softmax
                 prob = torch.softmax(logit * _temp, -1)
                 # 将logit乘以温度_temp后再做softmax，得到每个位置上每个token的概率分布

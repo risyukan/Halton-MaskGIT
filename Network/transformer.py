@@ -352,6 +352,12 @@ class Transformer(nn.Module):
                 indexing="ij"
             )
             coords = torch.stack([yy, xx], dim=-1).reshape(-1, 2).float()
+            # 例如每 2x2 合并一次（你也可以改成 4 等）
+            merge_stride = 2
+            Wc = (w + merge_stride - 1) // merge_stride  # ceil(w/stride)
+
+            cell_flat = ((yy // merge_stride) * Wc + (xx // merge_stride)).reshape(-1)  # [h*w]
+
 
             merged_batches, clusters, sizes, max_tokens = [], [], [], 0
             for i in range(b):
@@ -359,14 +365,6 @@ class Transformer(nn.Module):
                 center_idx = torch.nonzero(cm_flat[i], as_tuple=False).squeeze(-1)
                 keep_idx = torch.nonzero(~gm_flat[i], as_tuple=False).squeeze(-1)
 
-                if center_idx.numel() == 0:
-                    cluster_ids = torch.arange(h * w, device=x.device)
-                    counts = torch.ones(h * w, device=x.device, dtype=torch.long)
-                    merged_batches.append(x[i:i+1])
-                    clusters.append(cluster_ids)
-                    sizes.append(h * w)
-                    max_tokens = max(max_tokens, h * w)
-                    continue
 
                 cluster_ids = torch.empty(h * w, device=x.device, dtype=torch.long)
                 # 已解码 token 保持独立
@@ -375,12 +373,20 @@ class Transformer(nn.Module):
                 # 当前步中心
                 cluster_ids[center_idx] = torch.arange(center_idx.numel(), device=x.device) + offset
 
-                if masked_idx.numel() > 0:
-                    dist = torch.cdist(coords[masked_idx], coords[center_idx], p=2)
-                    nearest = dist.argmin(dim=1) + offset
-                    cluster_ids[masked_idx] = nearest
+                # cluster_ids 已经给 keep_idx 和 center_idx 分配好了
+                center_num = center_idx.numel()
+                offset2 = offset + center_num  # masked clusters 从这里开始编号
 
-                counts = torch.bincount(cluster_ids, minlength=offset + center_idx.numel()).clamp_min(1)
+                if masked_idx.numel() > 0:
+                    # 只对 masked_idx 做网格分组，然后压缩成连续 cluster id
+                    cell_ids = cell_flat[masked_idx]  # [n_masked]
+                    uniq_cell, inv = torch.unique(cell_ids, return_inverse=True)
+                    cluster_ids[masked_idx] = inv + offset2
+
+
+                minlength = offset2 + (uniq_cell.numel() if masked_idx.numel() > 0 else 0)
+                counts = torch.bincount(cluster_ids, minlength=minlength).clamp_min(1)
+
                 merged_batches.append(_merge_tokens_spatial(x[i:i+1], cluster_ids, counts))
                 clusters.append(cluster_ids)
                 sizes.append(counts.numel())
