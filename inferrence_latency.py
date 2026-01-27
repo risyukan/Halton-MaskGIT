@@ -44,8 +44,9 @@ sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=
 
 # [goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear]
 labels = torch.LongTensor([1, 7, 282, 604, 724, 179, 681, 850]).to(args.device)
+labels = labels.repeat(4)  # Repeat labels to increase batch size for latency test
 
-gen_images = sampler(trainer=model, nb_sample=8, labels=labels, verbose=True)[0]
+
 
 def measure_inference_latency(model, sampler, labels, batch_size, num_runs=10):
     print(f"--- 开始测量 (设备: {args.device}) ---")
@@ -109,7 +110,7 @@ def measure_inference_latency(model, sampler, labels, batch_size, num_runs=10):
 
 # --- 执行测量 ---
 # 确保 labels 的数量与 nb_sample 一致，或者根据 batch_size 截断/重复 labels
-batch_size = 8
+batch_size = 32
 # 如果 labels 数量少于 batch_size，需要重复填充；如果多则截取。这里假设你是为了测试这8个 label
 test_labels = labels[:batch_size] 
 

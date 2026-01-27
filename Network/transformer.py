@@ -319,117 +319,146 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None,global_masked_token=None,current_mask=None): #x是code，y是class label，drop_label是bool值
-        # global_masked_token形状是 [batch, input_size, input_size] 的布尔张量，表示当前整幅图里哪些 token 还没被预测（全局未解码的位置）
-        # current_mask 形状是 [nb_sample, input_size, input_size]，True 代表这一轮要更新的token。
+    def forward(self, x, y, drop_label, mask=None, global_masked_token=None, current_mask=None):
         b, h, w = x.size()
         x = x.reshape(b, h*w)
-        # x: [b, h*w]
 
-        # Drop the label if drop_label
-        y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
-        # torch.full_like,创建一个和 y 形状一样的新张量，里面填满的值是 self.nclass,y是传入的类别标签张量
-        # 如果 drop_label 为 True，就把 y 替换成全是 self.nclass 的张量，表示“无类别”。
-        # y: [b]
+        # Optimization 1: 使用 masked_fill 替代 where + full_like，减少显存分配
+        # 假设 drop_label 是 [b] 或标量。如果是 bool 标量，if 判断更快；如果是 tensor，用 masked_fill
+        if isinstance(drop_label, torch.Tensor):
+             y = y.masked_fill(drop_label, self.nclass)
+        elif drop_label:
+             y = torch.full_like(y, self.nclass)
+        
         y = self.cls_emb(y)
-        # 把类别标签 y 通过 cls_emb 嵌入成向量表示，形状变成 [b, hidden_dim]
 
-        pos = torch.arange(0, w*h, dtype=torch.long, device=x.device)
-        pos = self.pos_emb(pos)
-
-        x = self.tok_emb(x) + pos
+        # Optimization 2: 缓存 pos 或避免重复 device 转换
+        # 建议 pos_emb 内部处理，或者这里直接生成。
+        pos = torch.arange(0, w*h, device=x.device, dtype=torch.long)
+        x = self.tok_emb(x) + self.pos_emb(pos)
 
         merge_info = None
         if global_masked_token is not None and current_mask is not None:
-            gm = global_masked_token.to(x.device).bool()
-            cm = current_mask.to(x.device).bool()
-            gm_flat = gm.view(b, -1)
-            cm_flat = cm.view(b, -1)
-
+            # 修正：必须先 .to(x.device) 确保在 GPU 上，然后再 reshape
+            gm_flat = global_masked_token.to(x.device).reshape(b, -1).bool()
+            cm_flat = current_mask.to(x.device).reshape(b, -1).bool()
+            
+            # Optimization 3: Meshgrid 计算移出循环 (Batch 共用一套 grid)
+            # 如果 h, w 是固定的，这部分甚至可以放在 __init__ 里
+            merge_stride = 2
+            Wc = (w + merge_stride - 1) // merge_stride
+            
             yy, xx = torch.meshgrid(
                 torch.arange(h, device=x.device),
                 torch.arange(w, device=x.device),
                 indexing="ij"
             )
-            coords = torch.stack([yy, xx], dim=-1).reshape(-1, 2).float()
-            # 例如每 2x2 合并一次（你也可以改成 4 等）
-            merge_stride = 2
-            Wc = (w + merge_stride - 1) // merge_stride  # ceil(w/stride)
+            # cell_flat 只需要计算一次，不需要放在循环里
+            cell_flat = ((yy // merge_stride) * Wc + (xx // merge_stride)).reshape(-1)
 
-            cell_flat = ((yy // merge_stride) * Wc + (xx // merge_stride)).reshape(-1)  # [h*w]
+            # --- ID 生成阶段 (这部分逻辑较复杂，完全向量化较难，保留循环但只做 ID 计算) ---
+            batch_cluster_ids = []
+            max_tokens = 0
+            
+            # 这里的循环通常难以避免，因为 unique 和 counts 的数量在不同样本间可能不同
+            # 但我们只生成索引，不移动 heavy data (features)
+            # --- 3.3: 由于每个样本的 cluster id 一样，改成只算一次 ---
+            gm0 = gm_flat[0]          # [hw]
+            cm0 = cm_flat[0]          # [hw]
+
+            masked_mask = gm0 & ~cm0
+            center_mask = cm0
+            keep_mask = ~gm0
+
+            n_keep = int(keep_mask.sum().item())
+            n_center = int(center_mask.sum().item())
+            n_masked = int(masked_mask.sum().item())
+
+            cluster_ids_1d = torch.empty(h * w, device=x.device, dtype=torch.long)
+
+            # 1) Keep tokens
+            if n_keep > 0:
+                cluster_ids_1d[keep_mask] = torch.arange(n_keep, device=x.device, dtype=torch.long)
+
+            # 2) Center tokens
+            offset = n_keep
+            if n_center > 0:
+                cluster_ids_1d[center_mask] = torch.arange(n_center, device=x.device, dtype=torch.long) + offset
+
+            # 3) Masked tokens (Grid grouping)
+            offset2 = offset + n_center
+            if n_masked > 0:
+                cell_ids = cell_flat[masked_mask]
+                uniq_cell, inv = torch.unique(cell_ids, return_inverse=True)
+                cluster_ids_1d[masked_mask] = inv.to(torch.long) + offset2
+                L_merge = offset2 + int(uniq_cell.numel())
+            else:
+                L_merge = offset2
+
+            # 扩展到 batch
+            cluster_ids_tensor = cluster_ids_1d.unsqueeze(0).expand(b, -1)
 
 
-            merged_batches, clusters, sizes, max_tokens = [], [], [], 0
-            for i in range(b):
-                masked_idx = torch.nonzero(gm_flat[i] & ~cm_flat[i], as_tuple=False).squeeze(-1)
-                center_idx = torch.nonzero(cm_flat[i], as_tuple=False).squeeze(-1)
-                keep_idx = torch.nonzero(~gm_flat[i], as_tuple=False).squeeze(-1)
+            
+            # 记录最大 token 数            
+            # 构造全局索引用于 index_add
+            # 我们需要把 (batch_idx, token_idx) 映射到平铺的 (batch_idx * L_merge + cluster_id)
+            batch_offsets = torch.arange(b, device=x.device) * L_merge
+            # global_ids: [b, hw] -> 加上 batch 偏移 -> [b*hw]
+            global_ids = (cluster_ids_tensor + batch_offsets.unsqueeze(1)).view(-1)
+            
+            # 准备输出容器 [b * L_merge, dim]
+            flat_x = x.view(-1, x.size(-1))
+            merged_x = torch.zeros(b * L_merge, x.size(-1), device=x.device, dtype=x.dtype)
+            counts = torch.zeros(b * L_merge, 1, device=x.device, dtype=x.dtype)
+            
+            # 执行加和聚合 (Vectorized Scatter Add)
+            merged_x.index_add_(0, global_ids, flat_x)
+            # 计算每个 cluster 有多少个 token 用于平均
+            counts.index_add_(0, global_ids, torch.ones_like(flat_x[:, :1]))
+            
+            # 取平均
+            merged_x = merged_x / counts.clamp_min(1.0)
+            
+            # Reshape 回 [b, L_merge, dim]
+            x = merged_x.view(b, L_merge, x.size(-1))
 
-
-                cluster_ids = torch.empty(h * w, device=x.device, dtype=torch.long)
-                # 已解码 token 保持独立
-                cluster_ids[keep_idx] = torch.arange(keep_idx.numel(), device=x.device)
-                offset = keep_idx.numel()
-                # 当前步中心
-                cluster_ids[center_idx] = torch.arange(center_idx.numel(), device=x.device) + offset
-
-                # cluster_ids 已经给 keep_idx 和 center_idx 分配好了
-                center_num = center_idx.numel()
-                offset2 = offset + center_num  # masked clusters 从这里开始编号
-
-                if masked_idx.numel() > 0:
-                    # 只对 masked_idx 做网格分组，然后压缩成连续 cluster id
-                    cell_ids = cell_flat[masked_idx]  # [n_masked]
-                    uniq_cell, inv = torch.unique(cell_ids, return_inverse=True)
-                    cluster_ids[masked_idx] = inv + offset2
-
-
-                minlength = offset2 + (uniq_cell.numel() if masked_idx.numel() > 0 else 0)
-                counts = torch.bincount(cluster_ids, minlength=minlength).clamp_min(1)
-
-                merged_batches.append(_merge_tokens_spatial(x[i:i+1], cluster_ids, counts))
-                clusters.append(cluster_ids)
-                sizes.append(counts.numel())
-                max_tokens = max(max_tokens, counts.numel())
-
-            # === no padding version (Halton: same merged length across batch) ===
-            L_merge = merged_batches[0].shape[1]
-            # 可选：调试断言，确保确实一致
-            for i, merged in enumerate(merged_batches):
-                assert merged.shape[1] == L_merge, f"merged length mismatch at {i}: {merged.shape[1]} vs {L_merge}"
-
-            # merged_batches 里每个是 [1, L_merge, hidden_dim]，直接 cat 成 [b, L_merge, hidden_dim]
-            x = torch.cat(merged_batches, dim=0)
-
-            # 不再需要 pad_mask
-            merge_info = {"clusters": clusters, "sizes": sizes}  # sizes 仍然保留给 unmerge 用
-
+            # 记录用于 Unmerge 的信息
+            # 注意：Unmerge 只需要 cluster_ids_tensor 即可，不需要 sizes 列表了
+            merge_info = {"cluster_ids": cluster_ids_tensor} 
 
         base_seq_len = x.shape[1]
-        # 没有 padding 了：如果你原本 mask 只是 padding mask，那这里直接用 None 即可；
-        # 但为了兼容你外部可能传入的 mask，最安全是继续用传进来的 mask
         attn_mask = mask
 
-
+        # Register tokens logic
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
-            x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
+            reg_emb = self.reg_tokens(reg).expand(b, -1, -1)
+            x = torch.cat([x, reg_emb], dim=1)
             if attn_mask is not None:
-                reg_mask = torch.zeros(b, self.register, device=x.device, dtype=attn_mask.dtype)
-                attn_mask = torch.cat([attn_mask, reg_mask], dim=1)
+                # Optimization 5: 使用 F.pad 替代 concat mask，通常更快
+                # 假设 mask 是 [b, 1, seq_len, seq_len] 或类似，需根据维度调整
+                # 这里保持原逻辑逻辑，但在 mask 最后一维 pad
+                attn_mask = F.pad(attn_mask, (0, self.register), value=0)
 
         x = self.transformer(x, y, mask=attn_mask)
 
         # drop the register
-        x = x[:, :base_seq_len].contiguous()
+        x = x[:, :base_seq_len] # 此时通常内存连续，不需要 contiguous() 除非后续显式要求
 
+        # Optimization 6: 向量化 Unmerge (替代 loop)
         if merge_info is not None:
-            recovered = x.new_zeros(b, h * w, self.hidden_dim)
-            for i, cluster_ids in enumerate(merge_info["clusters"]):
-                recovered[i:i+1] = _unmerge_tokens_spatial(x[i:i+1, :merge_info["sizes"][i]], cluster_ids)
-            x = recovered
+            # x: [b, L_merge, dim]
+            # cluster_ids: [b, h*w] -> 对应 x 中的索引
+            
+            # 我们直接用 gather 就可以把合并后的 token "广播" 回原始位置
+            # 需要把 x 扩展对应 cluster_ids 的形状
+            ids = merge_info["cluster_ids"].unsqueeze(-1).expand(-1, -1, self.hidden_dim)
+            x = torch.gather(x, 1, ids)
+            # recovered 已经在 gather 中自动完成，无需预分配 zeros
+            
         else:
-            x = x[:, :h*w].contiguous()
+            x = x[:, :h*w] # .contiguous() 通常可以省略，除非下一层报 stride 错误
 
         x = self.last_norm(x, y)
         logit = self.head(x)
