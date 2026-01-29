@@ -339,10 +339,12 @@ class Transformer(nn.Module):
         y = self.cls_emb(y)
         # 把类别标签 y 通过 cls_emb 嵌入成向量表示，形状变成 [b, hidden_dim]
 
-        pos = torch.arange(0, w * h, dtype=torch.long, device=x.device)
-        pos = self.pos_emb(pos)
-
-        x = self.tok_emb(x) + pos
+                # === CHANGED: tok 和 pos 分开 ===
+                # x: [b, h*w]
+        # === CHANGED: tok 与 pos 分离 ===
+        pos_ids = torch.arange(0, w * h, dtype=torch.long, device=x.device)
+        pos_full = self.pos_emb(pos_ids)         # [hw, C]
+        tok_full = self.tok_emb(x)               # [b, hw, C]
 
         merge_info = None
         if global_masked_token is not None and current_mask is not None:
@@ -356,60 +358,66 @@ class Transformer(nn.Module):
                 torch.arange(w, device=x.device),
                 indexing="ij",
             )
-            coords = torch.stack([yy, xx], dim=-1).reshape(-1, 2).float()
-            # 例如每 2x2 合并一次（你也可以改成 4 等）
             merge_stride = 2
-            Wc = (w + merge_stride - 1) // merge_stride  # ceil(w/stride)
+            Wc = (w + merge_stride - 1) // merge_stride
+            cell_flat = ((yy // merge_stride) * Wc + (xx // merge_stride)).reshape(-1)
 
-            cell_flat = ((yy // merge_stride) * Wc + (xx // merge_stride)).reshape(-1)  # [h*w]
-
-            merged_batches, clusters, sizes, max_tokens = [], [], [], 0
+            merged_batches, clusters, sizes = [], [], []
             for i in range(b):
                 masked_idx = torch.nonzero(gm_flat[i] & ~cm_flat[i], as_tuple=False).squeeze(-1)
                 center_idx = torch.nonzero(cm_flat[i], as_tuple=False).squeeze(-1)
                 keep_idx = torch.nonzero(~gm_flat[i], as_tuple=False).squeeze(-1)
 
                 cluster_ids = torch.empty(h * w, device=x.device, dtype=torch.long)
-                # 已解码 token 保持独立
                 cluster_ids[keep_idx] = torch.arange(keep_idx.numel(), device=x.device)
                 offset = keep_idx.numel()
-                # 当前步中心
                 cluster_ids[center_idx] = torch.arange(center_idx.numel(), device=x.device) + offset
 
-                # cluster_ids 已经给 keep_idx 和 center_idx 分配好了
                 center_num = center_idx.numel()
-                offset2 = offset + center_num  # masked clusters 从这里开始编号
+                offset2 = offset + center_num
 
                 if masked_idx.numel() > 0:
-                    # 只对 masked_idx 做网格分组，然后压缩成连续 cluster id
-                    cell_ids = cell_flat[masked_idx]  # [n_masked]
+                    cell_ids = cell_flat[masked_idx]
                     uniq_cell, inv = torch.unique(cell_ids, return_inverse=True)
                     cluster_ids[masked_idx] = inv + offset2
+                    K = uniq_cell.numel()
+                else:
+                    K = 0
 
-                minlength = offset2 + (uniq_cell.numel() if masked_idx.numel() > 0 else 0)
+                minlength = offset2 + K
                 counts = torch.bincount(cluster_ids, minlength=minlength).clamp_min(1)
 
-                merged_batches.append(_merge_tokens_spatial(x[i : i + 1], cluster_ids, counts))
-                clusters.append(cluster_ids)
-                sizes.append(counts.numel())
-                max_tokens = max(max_tokens, counts.numel())
+                # === CHANGED: merge tok only, then add representative pos ===
+                tok_merged = _merge_tokens_spatial(tok_full[i : i + 1], cluster_ids, counts)  # [1, M, C]
+                M = counts.numel()
+                rep_pos_idx = torch.empty(M, device=x.device, dtype=torch.long)
+                rep_pos_idx[:offset] = keep_idx
+                rep_pos_idx[offset:offset2] = center_idx
+                if K > 0:
+                    for k in range(K):
+                        rep_pos_idx[offset2 + k] = masked_idx[(inv == k).nonzero(as_tuple=False)[0, 0]]
 
-            # === no padding version (Halton: same merged length across batch) ===
+                pos_merged = pos_full[rep_pos_idx].unsqueeze(0)  # [1, M, C]
+                merged_batches.append(tok_merged + pos_merged)
+
+                clusters.append(cluster_ids)
+                sizes.append(M)
+
             L_merge = merged_batches[0].shape[1]
-            # 可选：调试断言，确保确实一致
             for i, merged in enumerate(merged_batches):
                 assert merged.shape[1] == L_merge, f"merged length mismatch at {i}: {merged.shape[1]} vs {L_merge}"
 
-            # merged_batches 里每个是 [1, L_merge, hidden_dim]，直接 cat 成 [b, L_merge, hidden_dim]
             x = torch.cat(merged_batches, dim=0)
+            merge_info = {"clusters": clusters, "sizes": sizes}
 
-            # 不再需要 pad_mask
-            merge_info = {"clusters": clusters, "sizes": sizes}  # sizes 仍然保留给 unmerge 用
+        else:
+            # === CHANGED: no merge -> add pos here ===
+            x = tok_full + pos_full.unsqueeze(0)  # [b, hw, C]
 
         base_seq_len = x.shape[1]
         # 没有 padding 了：如果你原本 mask 只是 padding mask，那这里直接用 None 即可；
         # 但为了兼容你外部可能传入的 mask，最安全是继续用传进来的 mask
-        attn_mask = mask
+        attn_mask = None
 
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
