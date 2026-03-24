@@ -3,11 +3,11 @@
 cd /home/victor/workspace/Halton-MaskGIT || exit
 
 # Path
-data_folder="/datasets_local/vbesnier/IN_feat_256_to_24/"
+data_folder="../datasets/imagenet"
 vit_folder="./saved_networks/ImageNet_384_large.pth"
-writer_log=""
+writer_log="./runs"
 vqgan_folder="./saved_networks/vq_ds16_c2i.pt"
-eval_folder="/datasets_local/ImageNet/"
+eval_folder="../datasets/imagenet/val"
 data="imagenet_feat"
 
 # Model size and compute FLOP

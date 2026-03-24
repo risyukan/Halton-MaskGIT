@@ -96,7 +96,12 @@ def _unmerge_tokens_spatial(xm_spatial, cluster_ids):
     return x
 # ======================================
 
-
+RETAIN_RATIO_SCHEDULE = [
+    1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,  # 0-7
+    0.90, 0.90, 0.85, 0.85, 0.80, 0.80, 0.75, 0.75,  # 8-15
+    0.65, 0.65, 0.55, 0.55, 0.45, 0.45, 0.35, 0.35,  # 16-23
+    0.25, 0.25, 0.18, 0.18, 0.12, 0.10, 0.08, 0.05   # 24-31
+]
 
 class FeedForward(nn.Module):
     def __init__(self, dim, h_dim, multiple_of=256, bias=False, dropout=0.):
@@ -148,32 +153,93 @@ class Attention(nn.Module):
         # will be KVCache object managed by inference context manager
         self.cache = None
 
-    def forward(self, x, mask=None):
-        b, h_w, _ = x.shape
-        # calculate query, key, value and split out heads
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        # normalize queries and keys
-        xq, xk = self.qk_norm(xq, xk, xv)
-        xq = xq.view(b, h_w, self.n_local_heads, self.head_dim)
-        xk = xk.view(b, h_w, self.n_local_heads, self.head_dim)
-        xv = xv.view(b, h_w, self.n_local_heads, self.head_dim)
+    def forward(self, x, mask=None, current=None, cache_dic=None, layer_idx=None):
+        b, n, _ = x.shape
 
-        # make heads be a batch dim
-        xq, xk, xv = (x.transpose(1, 2) for x in (xq, xk, xv))
-        # attention
+        # qkv
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk = self.qk_norm(xq, xk, xv)
+
+        xq = xq.view(b, n, self.n_local_heads, self.head_dim)
+        xk = xk.view(b, n, self.n_local_heads, self.head_dim)
+        xv = xv.view(b, n, self.n_local_heads, self.head_dim)
+
+        xq, xk, xv = (t.transpose(1, 2) for t in (xq, xk, xv))  # [B, H, N, D]
+
+        # ----------------------------
+        # Lazy decoder mode
+        # ----------------------------
+        if current is not None and current.get("lazy_mar", False):
+            layer_cache = cache_dic[layer_idx]
+
+            if current.get("is_force_fresh", False) or ("k" not in layer_cache):
+                # full refresh
+                layer_cache["k"] = xk.clone()
+                layer_cache["v"] = xv.clone()
+                k_full = layer_cache["k"]
+                v_full = layer_cache["v"]
+            else:
+                # save previous V before selective update at pruning layer
+                if layer_idx == 3 and "v" in layer_cache:
+                    current["pre_cache_v"] = layer_cache["v"].clone()
+
+                if torch.all(current["update_mask"]):
+                    # full-token update
+                    layer_cache["k"] = xk.clone()
+                    layer_cache["v"] = xv.clone()
+                    k_full = layer_cache["k"]
+                    v_full = layer_cache["v"]
+                else:
+                    # partial update: scatter new kv into full cache
+                    k_full = layer_cache["k"].clone()
+                    v_full = layer_cache["v"].clone()
+
+                    mask_kv = current["update_mask"].unsqueeze(1).unsqueeze(-1) \
+                        .expand(-1, self.n_local_heads, -1, self.head_dim)
+
+                    k_full.masked_scatter_(mask_kv, xk)
+                    v_full.masked_scatter_(mask_kv, xv)
+
+                    layer_cache["k"] = k_full
+                    layer_cache["v"] = v_full
+
+            # attention: partial q attends full kv cache
+            if self.flash:
+                # lazy mode 下最好先不用 mask，避免裁剪后 mask 长度不一致
+                output = F.scaled_dot_product_attention(
+                    xq, k_full, v_full,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.
+                )
+            else:
+                scores = torch.matmul(xq, k_full.transpose(2, 3)) / math.sqrt(self.head_dim)
+                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                output = torch.matmul(scores, v_full)
+
+            output = output.transpose(1, 2).contiguous().view(b, n, -1)
+            proj = self.wo(output)
+            if self.dropout > 0. and self.training:
+                proj = F.dropout(proj, self.dropout)
+            return proj
+
+        # ----------------------------
+        # original path
+        # ----------------------------
         if self.flash:
             if mask is not None:
-                mask = mask.view(b, 1, 1, h_w)
-            output = F.scaled_dot_product_attention(xq, xk, xv, mask, dropout_p=self.dropout if self.training else 0.)
+                mask = mask.view(b, 1, 1, n)
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, mask,
+                dropout_p=self.dropout if self.training else 0.
+            )
         else:
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             if mask is not None:
-                scores = scores + mask  # (bs, heads, seqlen, cache_len + seqlen)
+                scores = scores + mask
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
-        # concatenate all the heads
-        output = output.transpose(1, 2).contiguous().view(b, h_w, -1)
-        # output projection
+            output = torch.matmul(scores, xv)
+
+        output = output.transpose(1, 2).contiguous().view(b, n, -1)
         proj = self.wo(output)
         if self.dropout > 0. and self.training:
             proj = F.dropout(proj, self.dropout)
@@ -227,10 +293,108 @@ class Block(nn.Module):
         self.ln2 = RMSNorm(dim, linear=True, bias=False, eps=1e-5)
         self.ff = FeedForward(dim, mlp_dim, dropout=dropout)
 
-    def forward(self, x, cond, mask=None):
+    def _prune_tokens(self, x, current, cache_dic, layer_idx):
+        """
+        x: [B, N, C]
+        current['update_mask']: [B, N]  (full sequence mask)
+        cache_dic[layer_idx]['v']: [B, H, N, D]
+        current['pre_cache_v']: [B, H, N, D]
+        """
+        if "pre_cache_v" not in current:
+            return x
+        if layer_idx not in cache_dic or "v" not in cache_dic[layer_idx]:
+            return x
+        b, n, c = x.shape
+
+        # cosine similarity on V
+        cos_sim = F.cosine_similarity(
+            cache_dic[layer_idx]["v"],
+            current["pre_cache_v"],
+            dim=-1
+        )  # [B, H, N]
+
+        score = cos_sim.mean(dim=1)  # [B, N]
+
+        # force keep current prediction / previous prediction / registers
+        if "mask_to_pred_full" in current:
+            score[current["mask_to_pred_full"]] = -1e9
+        if "prev_mask_to_pred_full" in current:
+            score[current["prev_mask_to_pred_full"]] = -1e9
+        if "reg_full" in current:
+            score[current["reg_full"]] = -1e9
+
+        # sort ascending: low similarity => high change => keep
+        _, inds = torch.sort(score, dim=-1, descending=False)
+
+        cur_ratio = RETAIN_RATIO_SCHEDULE[min(current["step"], len(RETAIN_RATIO_SCHEDULE) - 1)]
+        must_keep = int(current["mask_to_pred_len"] + current["prev_mask_to_pred_len"] + 15)
+        keep_num = max(must_keep, int(score.shape[1] * cur_ratio))
+        keep_num = min(keep_num, n)
+
+        inds = inds[:, :keep_num]
+
+        next_mask = torch.zeros((b, n), device=x.device, dtype=torch.bool)
+        next_mask.scatter_(1, inds, True)
+
+        current["origi_update_mask"] = current["update_mask"]
+        current["update_mask"] = next_mask
+        current["next_mask"] = next_mask
+
+        x = torch.masked_select(
+            x,
+            next_mask.unsqueeze(-1).expand(-1, -1, c)
+        ).reshape(b, -1, c)
+
+        return x
+
+    def _unprune_tokens(self, x, current):
+        """
+        x: [B, N_keep, C]
+        restore to [B, N_full, C]
+        """
+        b, _, c = x.shape
+        n_full = current["next_mask"].shape[1]
+
+        full_x = torch.zeros((b, n_full, c), device=x.device, dtype=x.dtype)
+        full_x.masked_scatter_(
+            current["next_mask"].unsqueeze(-1).expand(-1, -1, c),
+            x
+        )
+
+        current["update_mask"] = current["origi_update_mask"]
+        current["origi_update_mask"] = None
+        current["next_mask"] = None
+        return full_x
+
+    def forward(self, x, cond, mask=None, current=None, cache_dic=None, layer_idx=None, depth=None):
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
-        x = x + alpha1.unsqueeze(1) * self.attn(modulate(self.ln1(x), gamma1, beta1), mask=mask)
+
+        x = x + alpha1.unsqueeze(1) * self.attn(
+            modulate(self.ln1(x), gamma1, beta1),
+            mask=mask,
+            current=current,
+            cache_dic=cache_dic,
+            layer_idx=layer_idx
+        )
+
+        # pruning only in lazy mode, at layer 3
+        if current is not None and current.get("lazy_mar", False):
+            if (
+                (not current.get("is_force_fresh", False))
+                and layer_idx == 3
+                and "pre_cache_v" in current
+                and layer_idx in cache_dic
+                and "v" in cache_dic[layer_idx]
+            ):
+                x = self._prune_tokens(x, current, cache_dic, layer_idx)
+
         x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+
+        # restore full sequence at final layer
+        if current is not None and current.get("lazy_mar", False):
+            if (not current.get("is_force_fresh", False)) and layer_idx == depth - 1 and current.get("next_mask", None) is not None:
+                x = self._unprune_tokens(x, current)
+
         return x
 
 
@@ -241,9 +405,16 @@ class TransformerEncoder(nn.Module):
         for _ in range(depth):
             self.layers.append(Block(dim, heads, mlp_dim, dropout=dropout))
 
-    def forward(self, x, cond, mask=None):
-        for block in self.layers:
-            x = block(x, cond, mask=mask)
+    def forward(self, x, cond, mask=None, current=None, cache_dic=None):
+        depth = len(self.layers)
+        for i, block in enumerate(self.layers):
+            x = block(
+                x, cond, mask=mask,
+                current=current,
+                cache_dic=cache_dic,
+                layer_idx=i,
+                depth=depth
+            )
         return x
 
 
@@ -319,136 +490,96 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None, global_masked_token=None, current_mask=None):
+    def forward(self, x, y, drop_label, mask=None, lazy_state=None):
       # x是code，y是class label，drop_label是bool值
         # global_masked_token形状是 [batch, input_size, input_size] 的布尔张量，
         # 表示当前整幅图里哪些 token 还没被预测（全局未解码的位置）
         #
         # current_mask 形状是 [nb_sample, input_size, input_size]，
         # True 代表这一轮要更新的token。
+    
 
         b, h, w = x.size()
-        x = x.reshape(b, h * w)
-        # x: [b, h*w]
+        x = x.reshape(b, h*w)
 
         # Drop the label if drop_label
         y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
-        # torch.full_like,创建一个和 y 形状一样的新张量，里面填满的值是 self.nclass,y是传入的类别标签张量
-        # 如果 drop_label 为 True，就把 y 替换成全是 self.nclass 的张量，表示“无类别”。
-        # y: [b]
         y = self.cls_emb(y)
-        # 把类别标签 y 通过 cls_emb 嵌入成向量表示，形状变成 [b, hidden_dim]
 
-                # === CHANGED: tok 和 pos 分开 ===
-                # x: [b, h*w]
-        # === CHANGED: tok 与 pos 分离 ===
-        pos_ids = torch.arange(0, w * h, dtype=torch.long, device=x.device)
-        pos_full = self.pos_emb(pos_ids)         # [hw, C]
-        tok_full = self.tok_emb(x)               # [b, hw, C]
+        pos = torch.arange(0, w*h, dtype=torch.long, device=x.device)
+        pos = self.pos_emb(pos)
 
-        merge_info = None
-        if global_masked_token is not None and current_mask is not None:
-            gm = global_masked_token.to(x.device).bool()
-            cm = current_mask.to(x.device).bool()
-            gm_flat = gm.view(b, -1)
-            cm_flat = cm.view(b, -1)
+        x = self.tok_emb(x) + pos
 
-            yy, xx = torch.meshgrid(
-                torch.arange(h, device=x.device),
-                torch.arange(w, device=x.device),
-                indexing="ij",
-            )
-            merge_stride = 2
-            Wc = (w + merge_stride - 1) // merge_stride
-            cell_flat = ((yy // merge_stride) * Wc + (xx // merge_stride)).reshape(-1)
-
-            merged_batches, clusters, sizes = [], [], []
-            for i in range(b):
-                masked_idx = torch.nonzero(gm_flat[i] & ~cm_flat[i], as_tuple=False).squeeze(-1)
-                center_idx = torch.nonzero(cm_flat[i], as_tuple=False).squeeze(-1)
-                keep_idx = torch.nonzero(~gm_flat[i], as_tuple=False).squeeze(-1)
-
-                cluster_ids = torch.empty(h * w, device=x.device, dtype=torch.long)
-                cluster_ids[keep_idx] = torch.arange(keep_idx.numel(), device=x.device)
-                offset = keep_idx.numel()
-                cluster_ids[center_idx] = torch.arange(center_idx.numel(), device=x.device) + offset
-
-                center_num = center_idx.numel()
-                offset2 = offset + center_num
-
-                if masked_idx.numel() > 0:
-                    cell_ids = cell_flat[masked_idx]
-                    uniq_cell, inv = torch.unique(cell_ids, return_inverse=True)
-                    cluster_ids[masked_idx] = inv + offset2
-                    K = uniq_cell.numel()
-                else:
-                    K = 0
-
-                minlength = offset2 + K
-                counts = torch.bincount(cluster_ids, minlength=minlength).clamp_min(1)
-
-                # === CHANGED: merge tok only, then add representative pos ===
-                tok_merged = _merge_tokens_spatial(tok_full[i : i + 1], cluster_ids, counts)  # [1, M, C]
-                M = counts.numel()
-                rep_pos_idx = torch.empty(M, device=x.device, dtype=torch.long)
-                rep_pos_idx[:offset] = keep_idx
-                rep_pos_idx[offset:offset2] = center_idx
-                if K > 0:
-                    for k in range(K):
-                        rep_pos_idx[offset2 + k] = masked_idx[(inv == k).nonzero(as_tuple=False)[0, 0]]
-
-                pos_merged = pos_full[rep_pos_idx].unsqueeze(0)  # [1, M, C]
-                merged_batches.append(tok_merged + pos_merged)
-
-                clusters.append(cluster_ids)
-                sizes.append(M)
-
-            L_merge = merged_batches[0].shape[1]
-            for i, merged in enumerate(merged_batches):
-                assert merged.shape[1] == L_merge, f"merged length mismatch at {i}: {merged.shape[1]} vs {L_merge}"
-
-            x = torch.cat(merged_batches, dim=0)
-            merge_info = {"clusters": clusters, "sizes": sizes}
-
-        else:
-            # === CHANGED: no merge -> add pos here ===
-            x = tok_full + pos_full.unsqueeze(0)  # [b, hw, C]
-
-        base_seq_len = x.shape[1]
-        # 没有 padding 了：如果你原本 mask 只是 padding mask，那这里直接用 None 即可；
-        # 但为了兼容你外部可能传入的 mask，最安全是继续用传进来的 mask
-        attn_mask = None
+        # reshape, proj to smaller space, reshape (patchify!)
+        if self.proj > 1:
+            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
+            x = self.in_proj(x)
+            _, _, h, w = x.shape
+            x = rearrange(x, 'b c h proj_w -> b (h proj_w) c', proj_h=h, proj_w=w, b=b, c=self.hidden_dim).contiguous()
 
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
-            x = torch.cat(
-                [x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)],
-                dim=1,
-            )
-            if attn_mask is not None:
-                reg_mask = torch.zeros(b, self.register, device=x.device, dtype=attn_mask.dtype)
-                attn_mask = torch.cat([attn_mask, reg_mask], dim=1)
+            x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        x = self.transformer(x, y, mask=attn_mask)
+        current = None
+        cache_dic = None
+
+        if lazy_state is not None and lazy_state.get("lazy_mar", False):
+            bsz, seq_len, _ = x.shape
+
+            # init per-layer cache
+            if "cache" not in lazy_state:
+                lazy_state["cache"] = {i: {} for i in range(len(self.transformer.layers))}
+            cache_dic = lazy_state["cache"]
+
+            # full sequence mask
+            update_mask = torch.ones((bsz, seq_len), device=x.device, dtype=torch.bool)
+
+            # image-token level masks (before register concat)
+            mask_to_pred = lazy_state.get("mask_to_pred", torch.zeros((bsz, seq_len), device=x.device, dtype=torch.bool))
+            prev_mask_to_pred = lazy_state.get("prev_mask_to_pred", torch.zeros((bsz, seq_len), device=x.device, dtype=torch.bool))
+
+            # if register tokens exist, append False for them
+            if self.register > 0:
+                reg_full = torch.zeros((bsz, self.register), device=x.device, dtype=torch.bool)
+                mask_to_pred_full = torch.cat([mask_to_pred, reg_full], dim=1)
+                prev_mask_to_pred_full = torch.cat([prev_mask_to_pred, reg_full], dim=1)
+
+                reg_keep = torch.zeros((bsz, seq_len), device=x.device, dtype=torch.bool)
+                reg_keep[:, -self.register:] = True
+            else:
+                mask_to_pred_full = mask_to_pred
+                prev_mask_to_pred_full = prev_mask_to_pred
+                reg_keep = torch.zeros((bsz, seq_len), device=x.device, dtype=torch.bool)
+
+            current = {
+                "lazy_mar": True,
+                "is_force_fresh": lazy_state.get("is_force_fresh", False),
+                "step": lazy_state.get("step", 0),
+                "update_mask": update_mask,
+                "mask_to_pred_full": mask_to_pred_full,
+                "prev_mask_to_pred_full": prev_mask_to_pred_full,
+                "mask_to_pred_len": int(mask_to_pred_full[0].sum().item()),
+                "prev_mask_to_pred_len": int(prev_mask_to_pred_full[0].sum().item()),
+                "reg_full": reg_keep,
+            }
+
+        x = self.transformer(x, y, mask=mask, current=current, cache_dic=cache_dic)
 
         # drop the register
-        x = x[:, :base_seq_len].contiguous()
+        x = x[:, :h*w].contiguous()
 
-        if merge_info is not None:
-            recovered = x.new_zeros(b, h * w, self.hidden_dim)
-            for i, cluster_ids in enumerate(merge_info["clusters"]):
-                recovered[i : i + 1] = _unmerge_tokens_spatial(
-                    x[i : i + 1, : merge_info["sizes"][i]],
-                    cluster_ids,
-                )
-            x = recovered
-        else:
-            x = x[:, : h * w].contiguous()
+        if self.proj > 1:
+            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
+            x = self.out_proj(x)
+            x = rearrange(x, 'b (c s1 s2) h w -> b (h s1 w s2) c', s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim).contiguous()
 
         x = self.last_norm(x, y)
         logit = self.head(x)
 
         return logit
+
 
 
 

@@ -103,6 +103,9 @@ class HaltonSampler(object):
             # leave=False: 这是一个 UI 细节。表示当这个循环结束（图像生成完）时，进度条会自动从屏幕上消失，不会留下杂乱的日志
             # 只有在 verbose=True 时，才会显示进度条
             prev_r = 0 # 掩码比例（Ratio）的起点
+            prev_mask_to_pred = torch.zeros(
+            nb_sample, trainer.input_size, trainer.input_size,
+            dtype=torch.bool, device=trainer.args.device)
             for index in bar:
                 # Compute the number of tokens to predict
                 ratio = ((index + 1) / self.step)
@@ -131,15 +134,32 @@ class HaltonSampler(object):
                 if index < self.temp_warmup:
                     _temp *= 0.5  # Reduce temperature during warmup
 
-                if self.w != 0: # Model Prediction with cfg
+                if self.w != 0:
                     with trainer.autocast:
-                        global_masked_token = torch.cat([is_masked, is_masked], dim=0) if (index >=9 and index <=19) else None
-                        logit = trainer.vit(torch.cat([code.clone(), code.clone()], dim=0),
-                                            torch.cat([labels, labels], dim=0),
-                                            torch.cat([~drop, drop], dim=0),
-                                            global_masked_token = global_masked_token,# 传入模型的全局掩码，告诉模型哪些位置是被mask的
-                                            current_mask = torch.cat([mask, mask], dim=0)# 传入模型的当前掩码，告诉模型哪些位置是本step需要预测的
-                                            )
+                        code_in = torch.cat([code.clone(), code.clone()], dim=0)
+                        label_in = torch.cat([labels, labels], dim=0)
+                        drop_in = torch.cat([~drop, drop], dim=0)
+
+                        is_force_fresh = (index < 15) or ((index - 5) % 9 == 0)
+
+                        current_mask_cfg = torch.cat([mask, mask], dim=0).flatten(1).to(code.device)
+                        prev_mask_cfg = torch.cat([prev_mask_to_pred, prev_mask_to_pred], dim=0).flatten(1).to(code.device)
+
+                        lazy_state = {
+                            "lazy_mar": True,
+                            "step": index,
+                            "is_force_fresh": is_force_fresh,
+                            "mask_to_pred": current_mask_cfg,
+                            "prev_mask_to_pred": prev_mask_cfg,
+                        }
+
+                        logit = trainer.vit(
+                            code_in,
+                            label_in,
+                            drop_in,
+                            mask=None,
+                            lazy_state=lazy_state
+                        )
                         # ==== DEBUG: check logit vocab size ====
                         if index == 0:  # 只打印一次，避免刷屏
                             print("[DEBUG] logit.shape =", tuple(logit.shape))
@@ -183,6 +203,7 @@ class HaltonSampler(object):
                 l_mask.append(mask.view(nb_sample, trainer.input_size, trainer.input_size).clone().float())
                 # 记录了每一轮使用的掩码分布。float()转换是为了后续可视化方便，True变1.0，False变0.0
                 prev_r = r
+                prev_mask_to_pred = mask.clone()
                 # 通过将 r（当前步的终点）赋值给 prev_r（下一步的起点），确保了在下一轮迭代中，切片操作会从正确的位置开始，不会重复处理已经预测过的 Halton 坐标。
             # Decode the final prediction
             code = torch.clamp(code, 0, trainer.args.codebook_size - 1)
