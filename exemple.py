@@ -13,7 +13,7 @@ args = load_args_from_file(config_path)
 args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Select Network (Large 384 is the best, but the slowest)
-args.vit_size = "Large"  # "tiny", "small", "base", "large"
+args.vit_size = "large"  # "tiny", "small", "base", "large"
 args.img_size = 384  # 256 or 384
 args.compile = False
 args.dtype = "float32"
