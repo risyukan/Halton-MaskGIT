@@ -106,6 +106,8 @@ class HaltonSampler(object):
             prev_mask_to_pred = torch.zeros(
             nb_sample, trainer.input_size, trainer.input_size,
             dtype=torch.bool, device=trainer.args.device)
+            # LazyMAR: lazy_state 在循环外创建一次，cache key 由 transformer 首次 forward 时写入并持久化
+            lazy_state = {"lazy_mar": True}
             for index in bar:
                 # Compute the number of tokens to predict
                 ratio = ((index + 1) / self.step)
@@ -126,9 +128,6 @@ class HaltonSampler(object):
                     # 这里的xy可能写反了，但是不影响正方形图像生成
                 mask = mask.bool() # 增量掩码，形状: [nb_sample, input_size, input_size]，True表示该位置在当前step需要被预测
 
-                is_masked = (code == trainer.args.mask_value) # 找出当前 code 中哪些位置仍然是未预测的（即等于 mask_value 的位置）
-
-
                 # Choose softmax temperature
                 _temp = self.temperature[index] ** self.temp_pow
                 if index < self.temp_warmup:
@@ -145,13 +144,13 @@ class HaltonSampler(object):
                         current_mask_cfg = torch.cat([mask, mask], dim=0).flatten(1).to(code.device)
                         prev_mask_cfg = torch.cat([prev_mask_to_pred, prev_mask_to_pred], dim=0).flatten(1).to(code.device)
 
-                        lazy_state = {
-                            "lazy_mar": True,
+                        # 只更新每步变化的字段；"cache" key 在首次 forward 后持久保留
+                        lazy_state.update({
                             "step": index,
                             "is_force_fresh": is_force_fresh,
                             "mask_to_pred": current_mask_cfg,
                             "prev_mask_to_pred": prev_mask_cfg,
-                        }
+                        })
 
                         logit = trainer.vit(
                             code_in,

@@ -26,7 +26,7 @@ def main():
     args.is_multi_gpus = False   # eval 模式不需要 DDP 包裹生成模型
     args.is_master = is_main
 
-    args.vit_size = "Large"
+    args.vit_size = "large"
     args.img_size = 384
     args.compile = False
     args.dtype = "float32"
