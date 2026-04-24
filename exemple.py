@@ -41,5 +41,5 @@ sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=
 # [goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear]
 labels = torch.LongTensor([1, 7, 282, 604, 724, 179, 681, 850]).to(args.device)
 
-gen_images = sampler(trainer=model, nb_sample=8, labels=labels, verbose=True)[0]
+gen_images = sampler(trainer=model, nb_sample=8, labels=labels, verbose=True, partial_update=True)[0]
 show_images_grid(gen_images)

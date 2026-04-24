@@ -26,7 +26,7 @@ def main():
     args.is_multi_gpus = False   # eval 模式不需要 DDP 包裹生成模型
     args.is_master = is_main
 
-    args.vit_size = "Large"
+    args.vit_size = "large"
     args.img_size = 384
     args.compile = False
     args.dtype = "float32"
@@ -49,8 +49,8 @@ def main():
         if is_main:
             print("Set model.vqgan to eval mode.")
 
-    sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=0, w=0.5,
-                            sched_pow=2, step=32, randomize=False, top_k=-1)
+    sampler = HaltonSampler(sm_temp_min=1, sm_temp_max=1.2, temp_pow=1, temp_warmup=0, w=2,
+                            sched_pow=2, step=32, randomize=True, top_k=-1)
 
     # --- 3. 初始化 Metrics（每个 rank 各自持有一份 Inception 模型）---
     if is_main:
@@ -79,7 +79,7 @@ def main():
     with torch.no_grad():
         for _ in tqdm(range(num_batches), desc=f"[rank{local_rank}] Generating", disable=not is_main):
             labels = torch.randint(0, 1000, (batch_size,), device=local_rank)
-            gen_images = sampler(trainer=model, nb_sample=batch_size, labels=labels, verbose=False)[0]
+            gen_images = sampler(trainer=model, nb_sample=batch_size, labels=labels, verbose=False, partial_update=True)[0]
             metrics.update(gen_images, image_type="fake")
 
     dist.barrier()

@@ -38,7 +38,6 @@ class FeedForward(nn.Module):
         x = F.silu(self.w1(x)) * self.w3(x)
         if self.dropout > 0. and self.training:
             x = F.dropout(x, self.dropout)
-
         return self.w2(x)
 
 
@@ -57,7 +56,7 @@ class QKNorm(torch.nn.Module):
 class Attention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0., use_flash=True, bias=False):
         super().__init__()
-        self.flash = use_flash # use flash attention?
+        self.flash = use_flash
         self.n_local_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.dropout = dropout
@@ -65,42 +64,86 @@ class Attention(nn.Module):
         self.wk = nn.Linear(embed_dim, num_heads * self.head_dim, bias=bias)
         self.wv = nn.Linear(embed_dim, num_heads * self.head_dim, bias=bias)
         self.wo = nn.Linear(num_heads * self.head_dim, embed_dim, bias=bias)
-
         self.qk_norm = QKNorm(num_heads * self.head_dim)
-
-        # will be KVCache object managed by inference context manager
         self.cache = None
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, active_mask=None):
+        """
+        active_mask: (b, seq_len) bool — when provided, Q is computed only for
+        active (newly-released) positions; K/V use all positions.
+        Inactive positions receive a zero attention delta so the residual stream
+        is not updated via attention.  active_mask must have the same True-count
+        in every row (guaranteed by HaltonSampler's uniform step schedule).
+        """
         b, h_w, _ = x.shape
-        # calculate query, key, value and split out heads
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        # normalize queries and keys
-        xq, xk = self.qk_norm(xq, xk, xv)
-        xq = xq.view(b, h_w, self.n_local_heads, self.head_dim)
-        xk = xk.view(b, h_w, self.n_local_heads, self.head_dim)
-        xv = xv.view(b, h_w, self.n_local_heads, self.head_dim)
 
-        # make heads be a batch dim
-        xq, xk, xv = (x.transpose(1, 2) for x in (xq, xk, xv))
-        # attention
-        if self.flash:
-            if mask is not None:
-                mask = mask.view(b, 1, 1, h_w)
-            output = F.scaled_dot_product_attention(xq, xk, xv, mask, dropout_p=self.dropout if self.training else 0.)
+        if active_mask is None:
+            # ── Full update (original behaviour) ──────────────────────────
+            xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+            # normalize queries and keys
+            xq, xk = self.qk_norm(xq, xk, xv)
+            xq = xq.view(b, h_w, self.n_local_heads, self.head_dim)
+            xk = xk.view(b, h_w, self.n_local_heads, self.head_dim)
+            xv = xv.view(b, h_w, self.n_local_heads, self.head_dim)
+
+            # make heads be a batch dim
+            xq, xk, xv = (x.transpose(1, 2) for x in (xq, xk, xv))
+            # attention
+            if self.flash:
+                if mask is not None:
+                    mask = mask.view(b, 1, 1, h_w)
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, mask,
+                    dropout_p=self.dropout if self.training else 0.
+                )
+            else:
+                scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+                if mask is not None:
+                    scores = scores + mask  # (bs, heads, seqlen, cache_len + seqlen)
+                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
+            # concatenate all the heads
+            output = output.transpose(1, 2).contiguous().view(b, h_w, -1)
+            # output projection
+            proj = self.wo(output)
+            if self.dropout > 0. and self.training:
+                proj = F.dropout(proj, self.dropout)
+            return proj
+
         else:
-            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if mask is not None:
-                scores = scores + mask  # (bs, heads, seqlen, cache_len + seqlen)
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
-        # concatenate all the heads
-        output = output.transpose(1, 2).contiguous().view(b, h_w, -1)
-        # output projection
-        proj = self.wo(output)
-        if self.dropout > 0. and self.training:
-            proj = F.dropout(proj, self.dropout)
-        return proj
+            # ── Q-only-active: Q from U_t tokens, K/V from all tokens ─────
+            # active_mask: (b, h_w) bool, uniform True-count across rows
+            n_active = int(active_mask[0].sum().item())
+            x_active = x[active_mask].view(b, n_active, -1)   # (b, n_active, d)
+
+            xq = self.wq(x_active)   # (b, n_active, d)
+            xk = self.wk(x)          # (b, h_w,      d)
+            xv = self.wv(x)          # (b, h_w,      d)
+
+            # QK norm applied independently — different seq lengths are fine
+            xq = self.qk_norm.query_norm(xq).to(xv)
+            xk = self.qk_norm.key_norm(xk).to(xv)
+
+            xq = xq.view(b, n_active, self.n_local_heads, self.head_dim).transpose(1, 2)
+            xk = xk.view(b, h_w,      self.n_local_heads, self.head_dim).transpose(1, 2)
+            xv = xv.view(b, h_w,      self.n_local_heads, self.head_dim).transpose(1, 2)
+
+            # Cross-length attention: Q(n_active) attends to KV(h_w)
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                dropout_p=self.dropout if self.training else 0.
+            )  # (b, heads, n_active, head_dim)
+
+            output = output.transpose(1, 2).contiguous().view(b, n_active, -1)
+            proj = self.wo(output)   # (b, n_active, d)
+            if self.dropout > 0. and self.training:
+                proj = F.dropout(proj, self.dropout)
+
+            # Scatter back into a full-size zero tensor.
+            # Inactive positions stay zero → residual leaves them unchanged by attn.
+            out_full = torch.zeros(b, h_w, proj.shape[-1], device=x.device, dtype=x.dtype)
+            out_full[active_mask] = proj.reshape(b * n_active, -1)
+            return out_full
 
 
 class RMSNorm(nn.Module):
@@ -141,18 +184,23 @@ class AdaNorm(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, heads, mlp_dim, dropout=0.):
         super().__init__()
-
         self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
-
         self.ln1 = RMSNorm(dim, linear=True, bias=False, eps=1e-5)
         self.attn = Attention(dim, heads, dropout=dropout)
-
         self.ln2 = RMSNorm(dim, linear=True, bias=False, eps=1e-5)
         self.ff = FeedForward(dim, mlp_dim, dropout=dropout)
 
-    def forward(self, x, cond, mask=None):
+    def forward(self, x, cond, mask=None, active_mask=None):
+        """
+        active_mask: (b, seq_len) bool — forwarded only to Attention.
+        FFN always runs over all tokens regardless of active_mask.
+        """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
-        x = x + alpha1.unsqueeze(1) * self.attn(modulate(self.ln1(x), gamma1, beta1), mask=mask)
+        x = x + alpha1.unsqueeze(1) * self.attn(
+            modulate(self.ln1(x), gamma1, beta1),
+            mask=mask,
+            active_mask=active_mask,
+        )
         x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
         return x
 
@@ -164,9 +212,9 @@ class TransformerEncoder(nn.Module):
         for _ in range(depth):
             self.layers.append(Block(dim, heads, mlp_dim, dropout=dropout))
 
-    def forward(self, x, cond, mask=None):
-        for block in self.layers:
-            x = block(x, cond, mask=mask)
+    def forward(self, x, cond, mask=None, active_mask=None, partial_update_start_layer=3):
+        for i, block in enumerate(self.layers):
+            x = block(x, cond, mask=mask, active_mask=active_mask if i >= partial_update_start_layer else None)
         return x
 
 
@@ -177,38 +225,37 @@ class Transformer(nn.Module):
                  register=1, proj=1, **kwargs):
         super().__init__()
 
-        self.nclass = nclass                                             # Number of classes
-        self.input_size = input_size                                     # Number of tokens as input
-        self.hidden_dim = hidden_dim                                     # Hidden dimension of the transformer
-        self.codebook_size = codebook_size                               # Amount of code in the codebook
-        self.proj = proj                                                 # Projection
+        self.nclass = nclass
+        self.input_size = input_size
+        self.hidden_dim = hidden_dim
+        self.codebook_size = codebook_size
+        self.proj = proj
 
-        self.cls_emb = nn.Embedding(nclass + 1, hidden_dim)              # Embedding layer for the class token
-        self.tok_emb = nn.Embedding(codebook_size + 1, hidden_dim)       # Embedding layer for the 'visual' token
-        self.pos_emb = nn.Embedding(input_size ** 2, hidden_dim)         # Learnable Positional Embedding
+        self.cls_emb = nn.Embedding(nclass + 1, hidden_dim)
+        self.tok_emb = nn.Embedding(codebook_size + 1, hidden_dim)
+        self.pos_emb = nn.Embedding(input_size ** 2, hidden_dim)
 
         if self.proj > 1:
             self.in_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False)
             self.out_proj = nn.Conv2d(
-                hidden_dim, hidden_dim*4, kernel_size=1, stride=1, padding=0, bias=False
+                hidden_dim, hidden_dim * 4, kernel_size=1, stride=1, padding=0, bias=False
             ).to(memory_format=torch.channels_last)
 
-        # The Transformer Encoder a la BERT :)
-        self.transformer = TransformerEncoder(dim=hidden_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout)
+        self.transformer = TransformerEncoder(
+            dim=hidden_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout
+        )
 
-        self.last_norm = AdaNorm(x_dim=hidden_dim, y_dim=hidden_dim)   # Last Norm
-
+        self.last_norm = AdaNorm(x_dim=hidden_dim, y_dim=hidden_dim)
         self.head = nn.Linear(hidden_dim, codebook_size + 1)
-        self.head.weight = self.tok_emb.weight  # weight tied with the tok_emb layer
+        self.head.weight = self.tok_emb.weight
 
         self.register = register
         if self.register > 0:
             self.reg_tokens = nn.Embedding(self.register, hidden_dim)
 
-        self.initialize_weights()  # Init weight
+        self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -217,58 +264,79 @@ class Transformer(nn.Module):
 
         self.apply(_basic_init)
 
-        # Init embedding
         nn.init.normal_(self.cls_emb.weight, std=0.02)
         nn.init.normal_(self.tok_emb.weight, std=0.02)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
 
-        # Zero-out adaNorm modulation layers in blocks:
         for block in self.transformer.layers:
             nn.init.constant_(block.mlp[1].weight, 0)
             nn.init.constant_(block.mlp[1].bias, 0)
 
-        # Init proj layer
         if self.proj > 1:
             nn.init.xavier_uniform_(self.in_proj.weight)
             nn.init.xavier_uniform_(self.out_proj.weight)
 
-        # Init embedding
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None):
+    def forward(self, x, y, drop_label, mask=None, active_mask=None):
+        """
+        active_mask: (b, h, w) bool — newly-active token positions for
+        partial-update mode (Q-only-active attention).
+        Pass None for the standard full-update forward pass.
+        """
         b, h, w = x.size()
-        x = x.reshape(b, h*w)
+        h0, w0 = h, w   # original spatial dims before any proj
+        x = x.reshape(b, h * w)
 
-        # Drop the label if drop_label
         y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
         y = self.cls_emb(y)
 
-        pos = torch.arange(0, w*h, dtype=torch.long, device=x.device)
+        pos = torch.arange(0, w * h, dtype=torch.long, device=x.device)
         pos = self.pos_emb(pos)
 
         x = self.tok_emb(x) + pos
 
-        # reshape, proj to smaller space, reshape (patchify!)
         if self.proj > 1:
             x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
             x = self.in_proj(x)
-            _, _, h, w = x.shape
+            _, _, h, w = x.shape   # h, w updated to projected resolution
             x = rearrange(x, 'b c h proj_w -> b (h proj_w) c', proj_h=h, proj_w=w, b=b, c=self.hidden_dim).contiguous()
+
+        # Build sequence-level active_mask aligned with current seq length.
+        seq_active_mask = None
+        if active_mask is not None:
+            if self.proj > 1:
+                # Pool (b, h0, w0) → (b, h, w) by OR over each proj×proj patch.
+                # view(b, h, proj, w, proj) groups pixels by conv-patch correctly
+                # because PyTorch row-major layout maps [ph*proj+sh, pw*proj+sw]
+                # to indices [ph, sh, pw, sw] under this reshape.
+                am = active_mask.view(b, h, self.proj, w, self.proj)
+                am = am.any(2).any(3)          # (b, h, w) — active if any sub-token is
+                seq_active_mask = am.view(b, h * w)
+            else:
+                seq_active_mask = active_mask.view(b, h0 * w0)
+
+            if self.register > 0:
+                # Register tokens are never in U_t; they always attend fully.
+                reg_false = torch.zeros(b, self.register, dtype=torch.bool, device=x.device)
+                seq_active_mask = torch.cat([seq_active_mask, reg_false], dim=1)
 
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
             x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        x = self.transformer(x, y, mask=mask)
+        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask)
 
-        # drop the register
-        x = x[:, :h*w].contiguous()
+        x = x[:, :h * w].contiguous()   # drop register tokens
 
         if self.proj > 1:
             x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, b=b, c=self.hidden_dim).contiguous()
             x = self.out_proj(x)
-            x = rearrange(x, 'b (c s1 s2) h w -> b (h s1 w s2) c', s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim).contiguous()
+            x = rearrange(
+                x, 'b (c s1 s2) h w -> b (h s1 w s2) c',
+                s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim
+            ).contiguous()
 
         x = self.last_norm(x, y)
         logit = self.head(x)
@@ -279,8 +347,7 @@ class Transformer(nn.Module):
 if __name__ == "__main__":
     from thop import profile
 
-    for size in ["tiny", "small", "base"]: # "large", "xlarge"]:
-        # size = "tiny"
+    for size in ["tiny", "small", "base"]:
         print(size)
         if size == "tiny":
             hidden_dim, depth, heads = 384, 6, 6
@@ -297,13 +364,13 @@ if __name__ == "__main__":
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         input_size = 16
-        model = Transformer(input_size=input_size, nclass=1000, hidden_dim=hidden_dim, codebook_size=16834,
-                            depth=depth, heads=heads, mlp_dim=hidden_dim * 4, dropout=0.1).to(device)
-        # model = torch.compile(model)
+        model = Transformer(
+            input_size=input_size, nclass=1000, hidden_dim=hidden_dim, codebook_size=16834,
+            depth=depth, heads=heads, mlp_dim=hidden_dim * 4, dropout=0.1
+        ).to(device)
         code = torch.randint(0, 16384, size=(1, input_size, input_size)).to(device)
         cls = torch.randint(0, 1000, size=(1,)).to(device)
         d_label = (torch.rand(1) < 0.1).to(device)
 
         flops, params = profile(model, inputs=(code, cls, d_label))
         print(f"FLOPs: {flops//1e9:.2f}G, Params: {params/1e6:.2f}M")
-
