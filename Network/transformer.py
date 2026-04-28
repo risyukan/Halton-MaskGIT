@@ -192,16 +192,30 @@ class Block(nn.Module):
 
     def forward(self, x, cond, mask=None, active_mask=None):
         """
-        active_mask: (b, seq_len) bool — forwarded only to Attention.
-        FFN always runs over all tokens regardless of active_mask.
+        active_mask: (b, seq_len) bool — Attention always runs over all tokens;
+        FFN computes outputs only for active positions when active_mask is provided,
+        inactive positions receive a zero delta so the residual stream is unchanged.
+        FFN和attetion都只更新active_mask为True的位置，inactive位置保持不变（残差连接）。注意attenion仍然是全量计算的，active_mask只控制FFN的更新位置。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
+        # Attention: always full update regardless of active_mask
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
-            active_mask=active_mask,
+            active_mask=active_mask
         )
-        x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+        # FFN: active-only update when active_mask is provided
+        if active_mask is None:
+            x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+        else:
+            b, h_w, d = x.shape
+            n_active = int(active_mask[0].sum().item())
+            x_norm = modulate(self.ln2(x), gamma2, beta2)          # (b, h_w, d)
+            x_active = x_norm[active_mask].view(b, n_active, d)    # (b, n_active, d)
+            ff_active = self.ff(x_active)                          # (b, n_active, d)
+            ff_full = torch.zeros(b, h_w, d, device=x.device, dtype=x.dtype)
+            ff_full[active_mask] = ff_active.reshape(b * n_active, d)
+            x = x + alpha2.unsqueeze(1) * ff_full
         return x
 
 
@@ -214,7 +228,7 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x, cond, mask=None, active_mask=None, partial_update_start_layer=3):
         for i, block in enumerate(self.layers):
-            x = block(x, cond, mask=mask, active_mask=active_mask if i >= partial_update_start_layer else None)
+            x = block(x, cond, mask=mask, active_mask=active_mask if i >= partial_update_start_layer else None) #只在后面几layer使用partial_update
         return x
 
 
