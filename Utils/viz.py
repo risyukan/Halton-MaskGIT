@@ -73,7 +73,7 @@ def show_images_grid(batch, nrow=4, padding=2):
     # Display the grid
     plt.figure(figsize=(nrow * 2, (len(batch) // nrow + 1) * 2))
     plt.imshow(grid)
-    plt.savefig("only_attention_update_前半step_3layer以后.png")  # Save the grid image to a file
     plt.axis("off")
+    plt.savefig("FFN_attention_update_前三分之一step_3layer以后.png", bbox_inches="tight", pad_inches=0)
     plt.show()
 
