@@ -74,6 +74,6 @@ def show_images_grid(batch, nrow=4, padding=2):
     plt.figure(figsize=(nrow * 2, (len(batch) // nrow + 1) * 2))
     plt.imshow(grid)
     plt.axis("off")
-    plt.savefig("FFN_attention_update_前三分之一step_3layer以后.png", bbox_inches="tight", pad_inches=0)
+    plt.savefig("attetion_FFN_active_token_update_后半step_3layer以后.png", bbox_inches="tight", pad_inches=0)
     plt.show()
 

@@ -180,7 +180,7 @@ class HaltonSampler(object):
 
                 # active_mask sent to the transformer only in partial_update mode
                 vit_active_mask = None
-                if partial_update and index <= self.step // 2: #只在前半部分的step使用partial_update
+                if partial_update and index >= self.step // 2: #只在前半部分的step使用partial_update
                     vit_active_mask = U_t.to(trainer.args.device)
 
                 # Choose softmax temperature

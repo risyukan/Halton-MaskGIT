@@ -193,19 +193,29 @@ class Block(nn.Module):
     def forward(self, x, cond, mask=None, active_mask=None):
         """
         active_mask: (b, seq_len) bool —
-        Attention: Q-only-active update when active_mask is provided（active位置のみ更新、inactiveは残差で不変）。
-        FFN: 全token更新（active_maskの有無に関わらず常にfull）。
-        前半stepでactive_maskを渡す運用を想定: Attention=active-only / FFN=全token。
+        Attention: 全token更新（active_maskの有無に関わらず常にfull）。
+        FFN: active-only update when active_mask is provided（active位置のみ更新、inactiveは残差で不変）。
+        前半stepでactive_maskを渡す運用を想定: Attention=全token / FFN=active-only。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
-        # Attention: active-only update when active_mask is provided
+        # Attention: always full-token update
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
-            active_mask=active_mask
+            active_mask=active_mask,
         )
-        # FFN: always full-token update
-        x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+        # FFN: active-only update when active_mask is provided
+        if active_mask is None:
+            x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+        else:
+            b, h_w, d = x.shape
+            n_active = int(active_mask[0].sum().item())
+            x_active = x[active_mask].view(b, n_active, d)
+            ff_out = self.ff(modulate(self.ln2(x_active), gamma2, beta2))  # (b, n_active, d)
+            # Scatter the (gated) FFN delta back; inactive positions get zero delta.
+            delta = torch.zeros_like(x)
+            delta[active_mask] = (alpha2.unsqueeze(1) * ff_out).reshape(b * n_active, d)
+            x = x + delta
         return x
 
 
