@@ -159,6 +159,7 @@ class HaltonSampler(object):
 
             bar = tqdm(range(self.step), leave=False) if verbose else range(self.step)
             prev_r = 0
+            prev_U_t = None  # U_t from the previous step (for active-mask union)
             for index in bar:
                 # Compute the number of tokens to predict
                 ratio = ((index + 1) / self.step)
@@ -178,10 +179,20 @@ class HaltonSampler(object):
                 for i_mask in range(nb_sample):
                     M_t[i_mask, _m[i_mask, :, 0], _m[i_mask, :, 1]] = True
 
-                # active_mask sent to the transformer only in partial_update mode
+                # active_mask sent to the transformer only in partial_update mode.
+                # Active set = previous-step U_{t-1} ∪ current-step U_t
+                # (consecutive U_t / U_{t-1} are disjoint by Halton construction,
+                #  so per-row True-count stays uniform across the batch).
+                # Step-level gating (from analyze_ffn_delta_stability):
+                #   t >= 5  : skip early unstable steps
+                #   t < 31  : last step is computed in full
                 vit_active_mask = None
-                if partial_update and index >= self.step // 2: #只在前半部分的step使用partial_update
-                    vit_active_mask = U_t.to(trainer.args.device)
+                if partial_update and 5 <= index < 31:
+                    if prev_U_t is not None:
+                        active = prev_U_t | U_t #｜是按位或运算符，表示取两个布尔数组中对应位置的元素进行逻辑或运算，结果是一个新的布尔数组，其中每个元素的值为True如果对应位置的元素在prev_U_t或U_t中至少有一个为True，否则为False。
+                    else:
+                        active = U_t
+                    vit_active_mask = active.to(trainer.args.device)
 
                 # Choose softmax temperature
                 _temp = self.temperature[index] ** self.temp_pow
@@ -227,6 +238,7 @@ class HaltonSampler(object):
                 l_U_t.append(U_t.clone().float())
                 l_M_t.append(M_t.clone().float())
                 prev_r = r
+                prev_U_t = U_t  # remember for next step's active-mask union
 
             # Decode the final prediction
             code = torch.clamp(code, 0, trainer.args.codebook_size - 1)

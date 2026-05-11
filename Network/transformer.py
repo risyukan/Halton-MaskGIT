@@ -193,18 +193,24 @@ class Block(nn.Module):
     def forward(self, x, cond, mask=None, active_mask=None):
         """
         active_mask: (b, seq_len) bool —
-        Attention: 全token更新（active_maskの有無に関わらず常にfull）。
-        FFN: active-only update when active_mask is provided（active位置のみ更新、inactiveは残差で不変）。
-        前半stepでactive_maskを渡す運用を想定: Attention=全token / FFN=active-only。
+        当前配置:
+          - Attention: 当 active_mask 不为 None 时进入 active-only 模式
+                       (Q 仅取 active 位置, K/V 取全部 token; 输出仅写回 active 位置)。
+          - FFN: 始终对全部 token 计算 (不使用 active_mask)。
+        若需让 FFN 也回到 active-only, 把下方 `FFN_ACTIVE_ONLY` 分支取消注释、
+        并删除当前的 full-token FFN 行即可。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
-        # Attention: always full-token update
+        # Attention: active-only when active_mask is provided, else full update
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
             active_mask=active_mask,
         )
-        # FFN: active-only update when active_mask is provided
+        # FFN: full-token update (active_mask 不传入 FFN)
+        # x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+        # ── FFN_ACTIVE_ONLY (保留以便切回) ────────────────────────────────
+        # 如果要让 FFN 也走 active-only, 注释掉上面那一行, 启用下面这段:
         if active_mask is None:
             x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
         else:
@@ -226,9 +232,14 @@ class TransformerEncoder(nn.Module):
         for _ in range(depth):
             self.layers.append(Block(dim, heads, mlp_dim, dropout=dropout))
 
-    def forward(self, x, cond, mask=None, active_mask=None, partial_update_start_layer=3):
+    def forward(self, x, cond, mask=None, active_mask=None,
+                partial_update_start_layer=3, partial_update_end_layer=21):
+        # Layer-level gating (from analyze_ffn_delta_stability):
+        #   exclude layer 0 (no prior context) and very top layers — use
+        #   partial_update only in the stable mid-stack: start ≤ i ≤ end.
         for i, block in enumerate(self.layers):
-            x = block(x, cond, mask=mask, active_mask=active_mask if i >= partial_update_start_layer else None) #只在后面几layer使用partial_update
+            use_partial = partial_update_start_layer <= i <= partial_update_end_layer #use_partial为True时，表示在第3到第21层之间使用partial_update，即FFN只更新active_mask指定的位置；否则在其他层使用full update，即FFN更新所有位置。
+            x = block(x, cond, mask=mask, active_mask=active_mask if use_partial else None) #active_maskはTransformerEncoderの引数で、Blockのforwardに渡される。use_partialがTrueのとき、active_maskがBlockのforwardに渡され、FFNはactive_maskで指定された位置のみを更新する。use_partialがFalseのとき、active_maskはNoneとしてBlockのforwardに渡され、FFNは全ての位置を更新する。
         return x
 
 
