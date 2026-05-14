@@ -15,7 +15,7 @@ class SampleAndEval:
 
         self.device = device
 
-    def compute_images_features_and_save(self, dataloader):
+    def compute_images_features_and_save(self, dataloader, save_path):
         bar = tqdm(dataloader, leave=False, desc="Computing images features")
         for images, labels in bar:
             self.inception_metrics.update(images, image_type="real")
@@ -29,8 +29,8 @@ class SampleAndEval:
             "cov": real_features_cov.cpu(),
         }
 
-        # Save the dictionary to a file
-        torch.save(data, "./saved_networks/ImageNet_256_train_stats.pt")
+        torch.save(data, save_path)
+        print(f"Saved reference stats to {save_path}")
 
 
 if __name__ == "__main__":
@@ -47,4 +47,5 @@ if __name__ == "__main__":
     )[0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sae = SampleAndEval(device)
-    sae.compute_images_features_and_save(data_loader)
+    save_path = f"./saved_networks/ImageNet_{args.img_size}_train_stats.pt"
+    sae.compute_images_features_and_save(data_loader, save_path)

@@ -79,7 +79,7 @@ def main():
     with torch.no_grad():
         for _ in tqdm(range(num_batches), desc=f"[rank{local_rank}] Generating", disable=not is_main):
             labels = torch.randint(0, 1000, (batch_size,), device=local_rank)
-            gen_images = sampler(trainer=model, nb_sample=batch_size, labels=labels, verbose=False, partial_update=True)[0]
+            gen_images = sampler(trainer=model, nb_sample=batch_size, labels=labels, verbose=False, partial_update=False)[0]
             metrics.update(gen_images, image_type="fake")
 
     dist.barrier()
@@ -101,7 +101,7 @@ def main():
         fake_features_mean = fake_features.mean(dim=0)
         fake_features_cov  = metrics.cov(fake_features, fake_features_mean)
 
-        stats_path = "./saved_networks/ImageNet_384_val_stats.pt"
+        stats_path = f"./saved_networks/ImageNet_{args.img_size}_val_stats.pt"
         print(f"正在加载参考统计文件: {stats_path}")
         ref_stats = torch.load(stats_path, map_location=f"cuda:{local_rank}")
         real_features_mean = ref_stats["mu"].to(local_rank)

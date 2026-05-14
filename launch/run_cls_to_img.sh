@@ -3,12 +3,12 @@
 cd .. || exit
 
 # Path
-data_folder="our/path/to/the/right/folder"
-vit_folder="our/path/to/the/right/folder"
-writer_log="our/path/to/the/right/folder"
-vqgan_folder="our/path/to/the/right/folder"
-eval_folder="our/path/to/the/right/folder"
-data="imagenet_feat"
+data_folder=""
+vit_folder="./saved_networks/ImageNet_384_large.pth"
+writer_log="./logs/"
+vqgan_folder="./saved_networks/vq_ds16_c2i.pt"
+eval_folder="/work/Shared/Datasets/ILSVRC/ILSVRC2012/r"
+data="imagenet"
 
 # Model size and compute FLOP
 vit_size="large"

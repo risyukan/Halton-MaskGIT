@@ -130,6 +130,9 @@ class HaltonSampler(object):
             self.basic_halton_mask = self.build_halton_mask(trainer.input_size)
 
         trainer.vit.eval()
+        # 清空各 Block 的 FFN delta 缓存, 避免上一次 __call__ 的残留影响。
+        if hasattr(trainer.vit, "clear_ffn_cache"):
+            trainer.vit.clear_ffn_cache()
         l_codes = []   # intermediate predicted codes
         l_U_t = []     # per-step newly-released token mask  (U_t)
         l_M_t = []     # per-step cumulative released mask   (M_t)

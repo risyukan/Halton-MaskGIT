@@ -189,6 +189,13 @@ class Block(nn.Module):
         self.attn = Attention(dim, heads, dropout=dropout)
         self.ln2 = RMSNorm(dim, linear=True, bias=False, eps=1e-5)
         self.ff = FeedForward(dim, mlp_dim, dropout=dropout)
+        # 上一步本 layer 计算出的 (gated) FFN delta, 用于在 inactive 位置上代替 0。
+        # 形状 (b, h_w, d); shape mismatch 时自动重置。
+        self.cached_ffn_delta = None
+
+    def clear_ffn_cache(self):
+        """采样新一轮生成前调用, 避免跨 generation 串台。"""
+        self.cached_ffn_delta = None
 
     def forward(self, x, cond, mask=None, active_mask=None):
         """
@@ -196,32 +203,44 @@ class Block(nn.Module):
         当前配置:
           - Attention: 当 active_mask 不为 None 时进入 active-only 模式
                        (Q 仅取 active 位置, K/V 取全部 token; 输出仅写回 active 位置)。
-          - FFN: 始终对全部 token 计算 (不使用 active_mask)。
-        若需让 FFN 也回到 active-only, 把下方 `FFN_ACTIVE_ONLY` 分支取消注释、
-        并删除当前的 full-token FFN 行即可。
+          - FFN: 当 active_mask 不为 None 时只对 active 位置算 FFN;
+                  inactive 位置不算 FFN, 改为加上上一步同层缓存的 FFN delta
+                  (无缓存时退化为 0)。每次 forward 都把本步的完整 (gated)
+                  delta 存回 self.cached_ffn_delta 供下一步使用。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
         # Attention: active-only when active_mask is provided, else full update
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
-            active_mask=active_mask,
         )
-        # FFN: full-token update (active_mask 不传入 FFN)
-        # x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
-        # ── FFN_ACTIVE_ONLY (保留以便切回) ────────────────────────────────
-        # 如果要让 FFN 也走 active-only, 注释掉上面那一行, 启用下面这段:
+        # FFN: active-only when active_mask is provided, with cached-delta fill-in
         if active_mask is None:
-            x = x + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+            # full-token FFN; 同时刷新缓存
+            ff_delta = alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
+            x = x + ff_delta
+            self.cached_ffn_delta = ff_delta.detach()
         else:
             b, h_w, d = x.shape
             n_active = int(active_mask[0].sum().item())
             x_active = x[active_mask].view(b, n_active, d)
             ff_out = self.ff(modulate(self.ln2(x_active), gamma2, beta2))  # (b, n_active, d)
-            # Scatter the (gated) FFN delta back; inactive positions get zero delta.
-            delta = torch.zeros_like(x)
-            delta[active_mask] = (alpha2.unsqueeze(1) * ff_out).reshape(b * n_active, d)
+            active_delta = (alpha2.unsqueeze(1) * ff_out)                  # (b, n_active, d)
+
+            # 起点: inactive 位置取上一步缓存; 没有缓存或形状不匹配则用 0
+            if (
+                self.cached_ffn_delta is not None
+                and self.cached_ffn_delta.shape == x.shape
+                and self.cached_ffn_delta.dtype == x.dtype
+            ):
+                delta = self.cached_ffn_delta.clone()
+            else:
+                delta = torch.zeros_like(x)
+            # 覆盖 active 位置为本步新算的 delta
+            delta[active_mask] = active_delta.reshape(b * n_active, d)
+
             x = x + delta
+            self.cached_ffn_delta = delta.detach()
         return x
 
 
@@ -231,6 +250,10 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(Block(dim, heads, mlp_dim, dropout=dropout))
+
+    def clear_ffn_cache(self):
+        for blk in self.layers:
+            blk.clear_ffn_cache()
 
     def forward(self, x, cond, mask=None, active_mask=None,
                 partial_update_start_layer=3, partial_update_end_layer=21):
@@ -245,6 +268,11 @@ class TransformerEncoder(nn.Module):
 
 class Transformer(nn.Module):
     """ DiT-like transformer with adaLayerNorm with zero initializations """
+
+    def clear_ffn_cache(self):
+        """转发到 TransformerEncoder, 清空每层 Block 的 FFN delta 缓存。"""
+        self.transformer.clear_ffn_cache()
+
     def __init__(self, input_size=16, hidden_dim=768, codebook_size=1024,
                  depth=12, heads=16, mlp_dim=3072, dropout=0., nclass=1000,
                  register=1, proj=1, **kwargs):
