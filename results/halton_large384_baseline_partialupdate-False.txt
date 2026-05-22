@@ -1,0 +1,24 @@
+# Halton-MaskGIT 评估结果 — 原版 baseline (no partial_update)
+
+Model      : ImageNet_384_large.pth (H-MaskGIT-L, 24^2, 480M)
+Sampler    : halton, step=32, cfg_w=0.5, sm_temp=1.0, sm_temp_min=1.0,
+             temp_warmup=1, sched_pow=2, top_k=-1
+partial_update : False  (原版全 token 更新)
+dtype      : float32
+GPUs       : 4 (DDP), global_bsize=32
+num_images : 50000
+seed       : 42
+ref stats  : saved_networks/ImageNet_256_train_stats.pt
+            (经 Inception 前统一 resize 到 299，分辨率差异被洗掉)
+eval cmd   : bash launch/eval_fid_large384.sh
+date       : 2026-05-15
+
+------------------------------------------------------------
+{'FID': 2.541, 'IS': 256.1518}
+------------------------------------------------------------
+
+论文参考 (README): H-MaskGIT-L 384 -> FID 2.59 / IS 281
+本次复现 FID 2.541 ≈ 论文值，作为 partial_update 对照实验的基准。
+
+注: 修复了 Sampler 数值不稳 bug —— Categorical(probs=softmax(...)) 改为
+Categorical(logits=...)，否则 FID 会在 6~21 间剧烈波动。

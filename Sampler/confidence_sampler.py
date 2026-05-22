@@ -106,8 +106,12 @@ class ConfidenceSampler(object):
 
             prob = torch.softmax(logit * self.sm_temp, -1)
 
-            # Sample the code from the softmax prediction. Half-precision does not always work properly with torch.distributions.sample()
-            pred_code = torch.distributions.Categorical(probs=prob).sample()
+            # Sample the code. Pass logits (not probs) so PyTorch applies a
+            # numerically stable log_softmax internally; softmax probs can
+            # underflow to a row summing to <1 (esp. bf16 / large codebook)
+            # and fail Categorical's Simplex() check. prob is still used below
+            # for the confidence score.
+            pred_code = torch.distributions.Categorical(logits=logit * self.sm_temp).sample()
 
             conf = torch.gather(prob, -1, pred_code.unsqueeze(-1)).squeeze()
 

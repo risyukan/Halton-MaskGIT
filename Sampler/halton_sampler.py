@@ -1,3 +1,4 @@
+import os
 import torch
 import random
 import math
@@ -105,7 +106,7 @@ class HaltonSampler(object):
     # ------------------------------------------------------------------
 
     def __call__(self, trainer, init_code=None, nb_sample=50, labels=None,
-                 verbose=True, partial_update=False):
+                 verbose=True, partial_update=None):
         """
         Runs the Halton-based sampling process.
 
@@ -115,8 +116,14 @@ class HaltonSampler(object):
             nb_sample      -> int: Number of images to generate.
             labels         -> torch.Tensor: Class labels for conditional generation.
             verbose        -> bool: Whether to display progress.
-            partial_update -> bool: If True, pass active_mask (U_t) to the
+            partial_update -> bool|None: If True, pass active_mask (U_t) to the
                              transformer so attention uses Q-only-active mode.
+                             If None (default), fall back to the env var
+                             HALTON_PARTIAL_UPDATE ("1" -> True, else False).
+                             This lets the fixed eval pipeline
+                             (Metrics/sample_and_eval.py, which does not pass
+                             this arg) be toggled without code edits, while
+                             explicit callers (e.g. eval.py) keep full control.
 
         Returns:
             Tuple: (generated images,
@@ -124,6 +131,10 @@ class HaltonSampler(object):
                     l_U_t — list of per-step newly-released masks,
                     l_M_t — list of per-step cumulative released masks)
         """
+
+        # Resolve partial_update from env when the caller didn't specify it.
+        if partial_update is None:
+            partial_update = os.environ.get("HALTON_PARTIAL_UPDATE", "0") == "1"
 
         # Build the Halton mask if not already created
         if self.basic_halton_mask is None:
@@ -231,8 +242,14 @@ class HaltonSampler(object):
                     next_token_index = torch.multinomial(top_k_probs.view(-1, self.top_k), num_samples=1)
                     pred_code = top_k_indices.gather(-1, next_token_index.view(nb_sample, trainer.input_size ** 2, 1))
                 else:
-                    # Sample from the categorical distribution
-                    pred_code = torch.distributions.Categorical(probs=prob).sample()
+                    # Sample from the categorical distribution.
+                    # Pass logits (not probs): PyTorch then applies a
+                    # numerically stable log_softmax internally. Passing the
+                    # softmax probs instead can leave a row summing to <1 due to
+                    # accumulation rounding (notably in bf16 over 16k classes),
+                    # which fails Categorical's Simplex() check and, when it
+                    # doesn't hard-fail, samples garbage tokens that pollute FID.
+                    pred_code = torch.distributions.Categorical(logits=logit * _temp).sample()
 
                 # Update code with new predictions at U_t positions
                 code[U_t] = pred_code.view(nb_sample, trainer.input_size, trainer.input_size)[U_t]
