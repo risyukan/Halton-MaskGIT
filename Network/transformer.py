@@ -4,6 +4,7 @@
 #   - DiT: https://github.com/facebookresearch/DiT
 
 import math
+import os
 
 import torch
 from torch import nn
@@ -260,6 +261,20 @@ class TransformerEncoder(nn.Module):
         # Layer-level gating (from analyze_ffn_delta_stability):
         #   exclude layer 0 (no prior context) and very top layers — use
         #   partial_update only in the stable mid-stack: start ≤ i ≤ end.
+        # Env overrides let small/base runs preserve the "top-K layers full"
+        # tail without touching the large defaults.
+        _s = os.environ.get("HALTON_PARTIAL_START_LAYER")
+        if _s:
+            try:
+                partial_update_start_layer = int(_s)
+            except ValueError:
+                pass
+        _e = os.environ.get("HALTON_PARTIAL_END_LAYER")
+        if _e:
+            try:
+                partial_update_end_layer = int(_e)
+            except ValueError:
+                pass
         for i, block in enumerate(self.layers):
             use_partial = partial_update_start_layer <= i <= partial_update_end_layer #use_partial为True时，表示在第3到第21层之间使用partial_update，即FFN只更新active_mask指定的位置；否则在其他层使用full update，即FFN更新所有位置。
             x = block(x, cond, mask=mask, active_mask=active_mask if use_partial else None) #active_maskはTransformerEncoderの引数で、Blockのforwardに渡される。use_partialがTrueのとき、active_maskがBlockのforwardに渡され、FFNはactive_maskで指定された位置のみを更新する。use_partialがFalseのとき、active_maskはNoneとしてBlockのforwardに渡され、FFNは全ての位置を更新する。

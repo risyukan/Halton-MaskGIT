@@ -1,0 +1,9 @@
+# KV substitution ablation summary
+# vit=large img=384 steps=32 cfg-w=0.5 dtype=float32 nb=8 seed=42
+# gate: layer=3..21 step=5..30
+
+config    pixel_mse   pixel_l1  code_disagree    mse_min    mse_med    mse_max
+A           0.10729    0.21296         0.5384    0.03425    0.08874    0.22045
+B           0.11215    0.21184         0.5061    0.01462    0.12071    0.21288
+C           0.04346    0.11875         0.3114    0.01222    0.03861    0.08449
+D           0.11550    0.21376         0.5007    0.03297    0.11096    0.24249

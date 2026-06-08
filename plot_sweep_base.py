@@ -1,0 +1,132 @@
+"""Plot the partial-update cache-refresh sweep for the BASE-384 model.
+
+Same layout / methodology as plot_sweep.py (large model), but parameterised
+for H-MaskGIT-B (hidden=768, 12 layers) at cfg_w=0.7.
+
+Left  Y axis : FID (lower is better)
+Right Y axis : theoretical speedup based on FLOPs reduction (higher is better)
+X axis       : cache refresh interval N (categorical, includes the "no refresh"
+               case rendered as ∞)
+"""
+import os
+import matplotlib.pyplot as plt
+
+# --- FID data (from results/halton_base384_cfg07_partialupdate_sweep.txt) ---
+# N=1 is the left-anchor point: every gated step refreshes, so it is
+# numerically equivalent to the full-update baseline (FID 4.202, speedup 1.000×).
+N_LABELS = ['1', '2', '3', '4', '∞']
+X        = [0, 1, 2, 3, 4]              # equal spacing on x-axis
+FID      = [4.202, 4.2025, 4.2068, 4.2147, 6.3808]
+
+# --- theoretical FLOPs / speedup model ---
+# Per-block FLOP breakdown (Base model, d=768, seq=576):
+#   Attention proj 4*s*d^2 + matmul 2*s^2*d = 1.87 GFLOPs
+#   FFN  8*s*d^2 = 2.72 GFLOPs
+# -> FFN占 2.72 / (1.87+2.72) ≈ 0.59 of per-block compute
+F_FFN_FRAC = 0.59
+
+TOTAL_STEPS     = 32
+GATED_STEPS     = 26                  # step indices 5..30 inclusive
+TOTAL_LAYERS    = 12
+GATED_LAYERS    = 7                   # layer indices 3..9 inclusive (end layer=9)
+SEQ_LEN         = 576                 # 24x24 token grid
+N_ACTIVE        = 36                  # |U_{t-1} ∪ U_t| ≈ 2 × 576/32
+
+ACTIVE_FRAC          = N_ACTIVE / SEQ_LEN                    # ≈ 0.0625
+PARTIAL_BLOCK_RATIO  = (1 - F_FFN_FRAC) + F_FFN_FRAC * ACTIVE_FRAC
+# Step-level: gated layers shrink to PARTIAL_BLOCK_RATIO of a full block, the
+# rest of the layers stay full -> ratio of one partial step vs a full step:
+PARTIAL_STEP_RATIO = (
+    (TOTAL_LAYERS - GATED_LAYERS) / TOTAL_LAYERS
+    + GATED_LAYERS / TOTAL_LAYERS * PARTIAL_BLOCK_RATIO
+)
+
+
+def theoretical_speedup(refresh_n):
+    """N=0 -> never refresh (pure partial); N>=1 -> every N-th gated step is full."""
+    if refresh_n == 0:
+        n_refresh = 0
+    else:
+        n_refresh = (GATED_STEPS + refresh_n - 1) // refresh_n   # ceil(26/N)
+    n_partial = GATED_STEPS - n_refresh
+    non_gated = TOTAL_STEPS - GATED_STEPS                        # always full
+    cost = n_partial * PARTIAL_STEP_RATIO + n_refresh * 1.0 + non_gated * 1.0
+    baseline_cost = TOTAL_STEPS * 1.0
+    return baseline_cost / cost
+
+
+SPEEDUP = [
+    theoretical_speedup(1),    # baseline equivalent
+    theoretical_speedup(2),
+    theoretical_speedup(3),
+    theoretical_speedup(4),
+    theoretical_speedup(0),    # ∞
+]
+print(f'theoretical speedups: '
+      f'N=1 {SPEEDUP[0]:.3f}×  N=2 {SPEEDUP[1]:.3f}×  '
+      f'N=3 {SPEEDUP[2]:.3f}×  N=4 {SPEEDUP[3]:.3f}×  N=∞ {SPEEDUP[4]:.3f}×')
+
+BASELINE_FID     = 4.202
+BASELINE_LABEL   = f'baseline (full FFN) FID = {BASELINE_FID:.3f}'
+PARETO_BUDGET    = BASELINE_FID + 0.5
+PARETO_LABEL     = f'+0.5 FID budget = {PARETO_BUDGET:.3f}'
+
+OUT_PATH = os.path.join(os.path.dirname(__file__),
+                        'results', 'sweep_fid_vs_speedup_base.png')
+
+# --- plot ---
+fig, ax_fid = plt.subplots(figsize=(7.5, 4.8))
+color_fid = '#c0392b'
+color_spd = '#2c6fbb'
+
+# FID line (left axis)
+ax_fid.plot(X, FID, color=color_fid, marker='o', markersize=8,
+            linewidth=2, label='FID', zorder=3)
+ax_fid.set_xlabel('Cache refresh interval $N$', fontsize=12)
+ax_fid.set_ylabel('FID  ↓', color=color_fid, fontsize=12)
+ax_fid.tick_params(axis='y', labelcolor=color_fid)
+ax_fid.set_xticks(X)
+ax_fid.set_xticklabels(N_LABELS, fontsize=11)
+ax_fid.grid(True, alpha=0.3, linestyle=':')
+
+# baseline FID horizontal lines
+ax_fid.axhline(BASELINE_FID, color='gray', linestyle='--', linewidth=1,
+               alpha=0.8, label=BASELINE_LABEL)
+ax_fid.axhline(PARETO_BUDGET, color='gray', linestyle=':', linewidth=1,
+               alpha=0.6, label=PARETO_LABEL)
+
+# annotate FID values
+for x, y in zip(X, FID):
+    ax_fid.annotate(f'{y:.3f}', (x, y),
+                    textcoords='offset points', xytext=(0, 12),
+                    ha='center', fontsize=10, color=color_fid)
+
+# Speedup line (right axis)
+ax_spd = ax_fid.twinx()
+ax_spd.plot(X, SPEEDUP, color=color_spd, marker='s', markersize=8,
+            linewidth=2, linestyle='--', label='Theoretical speedup (FLOPs)', zorder=3)
+ax_spd.set_ylabel('Theoretical FLOPs speedup ×  ↑', color=color_spd, fontsize=12)
+ax_spd.tick_params(axis='y', labelcolor=color_spd)
+
+# annotate speedup values (to the right of each point, vertically centered)
+for x, y in zip(X, SPEEDUP):
+    ax_spd.annotate(f'{y:.3f}×', (x, y),
+                    textcoords='offset points', xytext=(10, 0),
+                    ha='left', va='center', fontsize=10, color=color_spd)
+
+# y-axis ranges - make FID axis breathable, especially around N=∞
+ax_fid.set_ylim(3.9, 6.8)
+ax_spd.set_ylim(0.95, 1.45)
+
+# combined legend (top-left)
+h1, l1 = ax_fid.get_legend_handles_labels()
+h2, l2 = ax_spd.get_legend_handles_labels()
+ax_fid.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, framealpha=0.92)
+
+plt.title('FID vs Cache Refresh Interval — H-MaskGIT-B 384 (fp32, cfg 0.7)',
+          fontsize=12, pad=12)
+fig.tight_layout()
+
+os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+plt.savefig(OUT_PATH, dpi=160, bbox_inches='tight')
+print(f'saved -> {OUT_PATH}')

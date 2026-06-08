@@ -1,0 +1,15 @@
+# Halton-MaskGIT FID-vs-cache-refresh sweep
+# Model    : ImageNet_384_large.pth (H-MaskGIT-L, 480M)
+# Sampler  : halton, step=32, cfg_w=0.5, fp32, seed=42
+# Partial  : step gate 5..30, layer gate 3..21, active = U_{t-1} ∪ U_t
+# Refresh  : HALTON_CACHE_REFRESH_N - every N-th gated step runs full FFN (cache rewrite)
+#            N=0 / unset : never refresh (pure partial)
+#            N=1         : refresh every step (≡ full-update baseline)
+#            N>=2        : 1 refresh every N gated steps  (1/N of steps refresh)
+#
+# config                                   FID      IS       runtime   notes
+baseline_full_FFN                          2.5410   256.15   3:59:21   reference (partial_update=False)
+partial_norefresh                          6.0475   183.06   3:11:18   N=0 / current partial behavior
+partial_refresh_every_N2                   2.665    248.8636 3:35:07   13/26 refresh (50%)
+partial_refresh_every_N3                   2.8696   244.8887 3:27:34   9/26 refresh (35%)
+partial_refresh_every_N4                   3.0226   240.3578 3:23:38   7/26 refresh (27%)

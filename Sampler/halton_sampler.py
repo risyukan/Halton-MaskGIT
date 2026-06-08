@@ -136,6 +136,19 @@ class HaltonSampler(object):
         if partial_update is None:
             partial_update = os.environ.get("HALTON_PARTIAL_UPDATE", "0") == "1"
 
+        # Cache-refresh cadence within the partial-update gate (steps 5..30).
+        # HALTON_CACHE_REFRESH_N semantics:
+        #   N missing / "" / <=0 : no periodic refresh (pure partial mode)
+        #   N = 1                : every gated step refreshes -> equivalent to
+        #                          full-update baseline (sanity check)
+        #   N >= 2               : every N-th gated step forces vit_active_mask=None
+        #                          so all blocks run full FFN and rewrite the cache;
+        #                          remaining N-1 steps stay in partial+cached mode.
+        try:
+            cache_refresh_n = int(os.environ.get("HALTON_CACHE_REFRESH_N", "0"))
+        except ValueError:
+            cache_refresh_n = 0
+
         # Build the Halton mask if not already created
         if self.basic_halton_mask is None:
             self.basic_halton_mask = self.build_halton_mask(trainer.input_size)
@@ -174,6 +187,7 @@ class HaltonSampler(object):
             bar = tqdm(range(self.step), leave=False) if verbose else range(self.step)
             prev_r = 0
             prev_U_t = None  # U_t from the previous step (for active-mask union)
+            gated_step_counter = 0  # counts steps that fall inside the partial-update gate
             for index in bar:
                 # Compute the number of tokens to predict
                 ratio = ((index + 1) / self.step)
@@ -202,11 +216,21 @@ class HaltonSampler(object):
                 #   t < 31  : last step is computed in full
                 vit_active_mask = None
                 if partial_update and 5 <= index < 31:
-                    if prev_U_t is not None:
-                        active = prev_U_t | U_t #｜是按位或运算符，表示取两个布尔数组中对应位置的元素进行逻辑或运算，结果是一个新的布尔数组，其中每个元素的值为True如果对应位置的元素在prev_U_t或U_t中至少有一个为True，否则为False。
-                    else:
-                        active = U_t
-                    vit_active_mask = active.to(trainer.args.device)
+                    # Decide if this gated step is a "refresh" step that runs
+                    # full FFN to rewrite cached_ffn_delta for all positions.
+                    is_refresh = (
+                        cache_refresh_n >= 1
+                        and (gated_step_counter % cache_refresh_n == 0)
+                    )
+                    gated_step_counter += 1
+                    if not is_refresh:
+                        if prev_U_t is not None:
+                            active = prev_U_t | U_t
+                        else:
+                            active = U_t
+                        vit_active_mask = active.to(trainer.args.device)
+                    # else: leave vit_active_mask=None so all blocks run the
+                    # full-FFN branch (active_mask=None) and refresh the cache.
 
                 # Choose softmax temperature
                 _temp = self.temperature[index] ** self.temp_pow
