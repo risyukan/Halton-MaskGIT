@@ -24,3 +24,8 @@ partial_refresh_every_N2                   4.2025   252.3444 1:33:00   13/26 ref
 partial_refresh_every_N3                   4.2068   250.7314 1:31:29   9/26 refresh (35%)
 partial_refresh_every_N4                   4.2147   246.4016 1:30:34   7/26 refresh (27%)
 partial_no_refresh                         6.3808   190.5972 1:27:54   0/26 refresh (pure partial)
+partial_refresh_every_N5                   4.2444   245.0057 1:30:19   6/26 refresh (23%)
+partial_refresh_every_N6                   4.3499   238.8107 1:30:00   5/26 refresh (19%)
+partial_refresh_every_N7                   4.3997   237.3327 1:29:19   4/26 refresh (15%)
+partial_refresh_every_N8                   4.4612   234.7692 1:29:21   4/26 refresh (15%)
+partial_refresh_every_N9                   4.5104   232.1246 1:29:14   3/26 refresh (12%)

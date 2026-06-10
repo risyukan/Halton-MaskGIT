@@ -14,9 +14,10 @@ import matplotlib.pyplot as plt
 # --- FID data (from results/halton_base384_cfg07_partialupdate_sweep.txt) ---
 # N=1 is the left-anchor point: every gated step refreshes, so it is
 # numerically equivalent to the full-update baseline (FID 4.202, speedup 1.000×).
-N_LABELS = ['1', '2', '3', '4', '∞']
-X        = [0, 1, 2, 3, 4]              # equal spacing on x-axis
-FID      = [4.202, 4.2025, 4.2068, 4.2147, 6.3808]
+N_LABELS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '∞']
+X        = list(range(10))              # equal spacing on x-axis
+FID      = [4.202, 4.2025, 4.2068, 4.2147, 4.2444,
+            4.3499, 4.3997, 4.4612, 4.5104, 6.3808]
 
 # --- theoretical FLOPs / speedup model ---
 # Per-block FLOP breakdown (Base model, d=768, seq=576):
@@ -55,16 +56,11 @@ def theoretical_speedup(refresh_n):
     return baseline_cost / cost
 
 
-SPEEDUP = [
-    theoretical_speedup(1),    # baseline equivalent
-    theoretical_speedup(2),
-    theoretical_speedup(3),
-    theoretical_speedup(4),
-    theoretical_speedup(0),    # ∞
-]
-print(f'theoretical speedups: '
-      f'N=1 {SPEEDUP[0]:.3f}×  N=2 {SPEEDUP[1]:.3f}×  '
-      f'N=3 {SPEEDUP[2]:.3f}×  N=4 {SPEEDUP[3]:.3f}×  N=∞ {SPEEDUP[4]:.3f}×')
+# refresh interval per point: N=1..9 then 0 (=∞, never refresh)
+REFRESH_N = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
+SPEEDUP   = [theoretical_speedup(n) for n in REFRESH_N]
+for lbl, spd in zip(N_LABELS, SPEEDUP):
+    print(f'  N={lbl:>2}  speedup {spd:.3f}×')
 
 BASELINE_FID     = 4.202
 BASELINE_LABEL   = f'baseline (full FFN) FID = {BASELINE_FID:.3f}'
