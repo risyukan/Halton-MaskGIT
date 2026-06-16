@@ -1,0 +1,32 @@
+# Halton-MaskGIT — small 384 / cfg=1.0 partial_update sweep
+#
+# Model      : ImageNet_384_small.pth (H-MaskGIT-S, 24^2 grid, hidden=512/12L)
+#              ~77.9M params (base 是 hidden=768/~155M, 仅宽度不同, 层数同为 12)
+# Sampler    : halton, step=32, cfg_w=1.0, sm_temp=1.0, sm_temp_min=1.0,
+#              temp_warmup=1, sched_pow=2, top_k=-1
+# dtype      : float32
+# GPUs       : 4 (DDP), global_bsize=32
+# num_images : 50000
+# seed       : 42
+# gate       : partial_update active in halton steps 5..30 (前 5 步/最后 1 步全量)
+# layer gate : partial_update layers 3..9 (HALTON_PARTIAL_END_LAYER=9)
+#              => 末尾 2 层 (i=10,11) 保持 full update, 与 base sweep 完全对齐
+#
+# 与 base-384 cfg=0.7 sweep 的差异 = 模型 (base hidden768 -> small hidden512)
+#   + cfg_w (base 0.7 -> small 1.0)。其余 sampler / step / 层 gate / seed 一致。
+# small 内部 N=1..9/norefresh 之间仅 HALTON_CACHE_REFRESH_N 不同, 严格可比。
+#
+# columns: config_name  FID  IS  runtime  refresh_ratio
+# ------------------------------------------------------------
+partial_refresh_every_N1                   6.101    241.3234 1:12:51   26/26 refresh (100%, == baseline)
+partial_refresh_every_N2                   6.1334   239.7734 1:10:04   13/26 refresh (50%)
+partial_refresh_every_N3                   6.0542   238.3552 1:09:37   9/26 refresh (35%)
+partial_refresh_every_N4                   6.0163   236.5815 1:08:54   7/26 refresh (27%)
+partial_refresh_every_N5                   6.0311   233.1378 1:08:57   6/26 refresh (23%)
+partial_refresh_every_N6                   6.0416   231.6288 1:08:10   5/26 refresh (19%)
+partial_refresh_every_N7                   6.0186   229.4144 1:08:00   4/26 refresh (15%)
+partial_refresh_every_N8                   6.096    226.2644 1:08:02   4/26 refresh (15%)
+partial_refresh_every_N9                   6.109    225.233  1:07:44   3/26 refresh (12%)
+partial_no_refresh                         7.5441   187.8465 1:07:09   0/26 refresh (pure partial)
+partial_refresh_every_N13                  6.3115   217.6882 1:07:47   2/26 refresh (8%)
+partial_refresh_every_N26                  6.8941   200.7416 1:18:37   1/26 refresh (4%)
