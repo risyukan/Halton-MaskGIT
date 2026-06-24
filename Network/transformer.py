@@ -67,14 +67,51 @@ class Attention(nn.Module):
         self.wo = nn.Linear(num_heads * self.head_dim, embed_dim, bias=bias)
         self.qk_norm = QKNorm(num_heads * self.head_dim)
         self.cache = None
+        # KV cache: post-QKNorm 的 K/V (b, h_w, d), splice 使用。
+        # 由 _maybe_splice_kv_cache 维护; clear_kv_cache 在新一轮生成前清空。
+        self.cached_xk = None
+        self.cached_xv = None
 
-    def forward(self, x, mask=None, active_mask=None):
+    def clear_kv_cache(self):
+        """采样新一轮生成前调用, 避免跨 generation 串台。"""
+        self.cached_xk = None
+        self.cached_xv = None
+
+    def _maybe_splice_kv_cache(self, xk, xv, kv_active_mask):
+        """splice fresh K/V (在 mask=True 位置) 与 cached K/V (在 mask=False 位置).
+
+        kv_active_mask: (b, h_w) bool —
+          - None: KV cache 本步未启用, 不读写 cached_xk/_xv, 直接返回 fresh 值
+          - all True: 等价于 refresh, splice 结果 == fresh, cache 被 fresh 覆盖
+          - 部分 True: True 位用 fresh, False 位用 cache, 结果存回 cache
+
+        cache 不存在或 shape/dtype 不匹配时退化为 fresh 全量, 并把当前值存入 cache。
+        """
+        if kv_active_mask is None:
+            return xk, xv
+        if (
+            self.cached_xk is not None
+            and self.cached_xk.shape == xk.shape
+            and self.cached_xk.dtype == xk.dtype
+        ):
+            m = kv_active_mask.unsqueeze(-1)
+            xk = torch.where(m, xk, self.cached_xk)
+            xv = torch.where(m, xv, self.cached_xv)
+        self.cached_xk = xk.detach()
+        self.cached_xv = xv.detach()
+        return xk, xv
+
+    def forward(self, x, mask=None, active_mask=None, kv_active_mask=None):
         """
         active_mask: (b, seq_len) bool — when provided, Q is computed only for
         active (newly-released) positions; K/V use all positions.
         Inactive positions receive a zero attention delta so the residual stream
         is not updated via attention.  active_mask must have the same True-count
         in every row (guaranteed by HaltonSampler's uniform step schedule).
+
+        kv_active_mask: (b, seq_len) bool —
+          独立于 active_mask 的 K/V cache 控制开关。详见
+          _maybe_splice_kv_cache 文档串。None 时完全不接触 cache 路径。
         """
         b, h_w, _ = x.shape
 
@@ -83,6 +120,8 @@ class Attention(nn.Module):
             xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
             # normalize queries and keys
             xq, xk = self.qk_norm(xq, xk, xv)
+            # KV cache splice (no-op when kv_active_mask is None).
+            xk, xv = self._maybe_splice_kv_cache(xk, xv, kv_active_mask)
             xq = xq.view(b, h_w, self.n_local_heads, self.head_dim)
             xk = xk.view(b, h_w, self.n_local_heads, self.head_dim)
             xv = xv.view(b, h_w, self.n_local_heads, self.head_dim)
@@ -124,6 +163,9 @@ class Attention(nn.Module):
             # QK norm applied independently — different seq lengths are fine
             xq = self.qk_norm.query_norm(xq).to(xv)
             xk = self.qk_norm.key_norm(xk).to(xv)
+            # KV cache splice (no-op when kv_active_mask is None); future-proof
+            # if Block.forward later wires active_mask through to attn.
+            xk, xv = self._maybe_splice_kv_cache(xk, xv, kv_active_mask)
 
             xq = xq.view(b, n_active, self.n_local_heads, self.head_dim).transpose(1, 2)
             xk = xk.view(b, h_w,      self.n_local_heads, self.head_dim).transpose(1, 2)
@@ -198,7 +240,11 @@ class Block(nn.Module):
         """采样新一轮生成前调用, 避免跨 generation 串台。"""
         self.cached_ffn_delta = None
 
-    def forward(self, x, cond, mask=None, active_mask=None):
+    def clear_kv_cache(self):
+        """采样新一轮生成前调用 attention.clear_kv_cache。"""
+        self.attn.clear_kv_cache()
+
+    def forward(self, x, cond, mask=None, active_mask=None, kv_active_mask=None):
         """
         active_mask: (b, seq_len) bool —
         当前配置:
@@ -208,12 +254,20 @@ class Block(nn.Module):
                   inactive 位置不算 FFN, 改为加上上一步同层缓存的 FFN delta
                   (无缓存时退化为 0)。每次 forward 都把本步的完整 (gated)
                   delta 存回 self.cached_ffn_delta 供下一步使用。
+
+        kv_active_mask: (b, seq_len) bool —
+          独立于 active_mask 的 K/V cache 控制, 直接透传到 self.attn.
+          None 时 attention 完全不接触 KV cache 路径。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
-        # Attention: active-only when active_mask is provided, else full update
+        # Attention: active-only when active_mask is provided, else full update.
+        # 注意: 现行 Block.forward 不把 active_mask 透传给 self.attn (Attention 的
+        # Q-only-active 分支在当前部署里是 dead code, FFN partial-update 才是实际生效路径)。
+        # kv_active_mask 永远透传, 由 Attention 决定是否走 cache splice。
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
+            kv_active_mask=kv_active_mask,
         )
         # FFN: active-only when active_mask is provided, with cached-delta fill-in
         if active_mask is None:
@@ -256,7 +310,11 @@ class TransformerEncoder(nn.Module):
         for blk in self.layers:
             blk.clear_ffn_cache()
 
-    def forward(self, x, cond, mask=None, active_mask=None,
+    def clear_kv_cache(self):
+        for blk in self.layers:
+            blk.clear_kv_cache()
+
+    def forward(self, x, cond, mask=None, active_mask=None, kv_active_mask=None,
                 partial_update_start_layer=3, partial_update_end_layer=21):
         # Layer-level gating (from analyze_ffn_delta_stability):
         #   exclude layer 0 (no prior context) and very top layers — use
@@ -277,7 +335,13 @@ class TransformerEncoder(nn.Module):
                 pass
         for i, block in enumerate(self.layers):
             use_partial = partial_update_start_layer <= i <= partial_update_end_layer #use_partial为True时，表示在第3到第21层之间使用partial_update，即FFN只更新active_mask指定的位置；否则在其他层使用full update，即FFN更新所有位置。
-            x = block(x, cond, mask=mask, active_mask=active_mask if use_partial else None) #active_maskはTransformerEncoderの引数で、Blockのforwardに渡される。use_partialがTrueのとき、active_maskがBlockのforwardに渡され、FFNはactive_maskで指定された位置のみを更新する。use_partialがFalseのとき、active_maskはNoneとしてBlockのforwardに渡され、FFNは全ての位置を更新する。
+            # KV cache 按"全层全开"策略, 不复用 partial gate (drift 实验显示浅层
+            # 单独 cache 不省事; 见 analyze_kv_substitution_ablation 配置 B)。
+            x = block(
+                x, cond, mask=mask,
+                active_mask=active_mask if use_partial else None,
+                kv_active_mask=kv_active_mask,
+            )
         return x
 
 
@@ -287,6 +351,10 @@ class Transformer(nn.Module):
     def clear_ffn_cache(self):
         """转发到 TransformerEncoder, 清空每层 Block 的 FFN delta 缓存。"""
         self.transformer.clear_ffn_cache()
+
+    def clear_kv_cache(self):
+        """转发到 TransformerEncoder, 清空每层 Attention 的 K/V 缓存。"""
+        self.transformer.clear_kv_cache()
 
     def __init__(self, input_size=16, hidden_dim=768, codebook_size=1024,
                  depth=12, heads=16, mlp_dim=3072, dropout=0., nclass=1000,
@@ -347,11 +415,17 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None, active_mask=None):
+    def forward(self, x, y, drop_label, mask=None, active_mask=None,
+                kv_active_mask=None):
         """
         active_mask: (b, h, w) bool — newly-active token positions for
         partial-update mode (Q-only-active attention).
         Pass None for the standard full-update forward pass.
+
+        kv_active_mask: (b, h, w) bool — controls per-position K/V cache splice
+        independently of active_mask. None ⇒ KV cache 不参与本次 forward。
+        语义: True 位 fresh K/V, False 位用 cache; refresh step 应传 all-True;
+        register 位会被自动 pad 为 True (永远 fresh, drift 较大不进 cache)。
         """
         b, h, w = x.size()
         h0, w0 = h, w   # original spatial dims before any proj
@@ -390,11 +464,32 @@ class Transformer(nn.Module):
                 reg_false = torch.zeros(b, self.register, dtype=torch.bool, device=x.device)
                 seq_active_mask = torch.cat([seq_active_mask, reg_false], dim=1)
 
+        # Build sequence-level kv_active_mask. Convention 与 active_mask 对称:
+        # OR-pool over proj patches, then pad register tail. register 用 True
+        # (永远 fresh) — 与 FFN 的 active_mask 在 register 上的 False 相反, 因为
+        # register token drift 与 still-masked 类似偏大, 进 KV cache 是毒源。
+        seq_kv_active_mask = None
+        if kv_active_mask is not None:
+            if self.proj > 1:
+                kvm = kv_active_mask.view(b, h, self.proj, w, self.proj)
+                kvm = kvm.any(2).any(3)
+                seq_kv_active_mask = kvm.view(b, h * w)
+            else:
+                seq_kv_active_mask = kv_active_mask.view(b, h0 * w0)
+
+            if self.register > 0:
+                reg_true = torch.ones(b, self.register, dtype=torch.bool, device=x.device)
+                seq_kv_active_mask = torch.cat([seq_kv_active_mask, reg_true], dim=1)
+
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
             x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask)
+        x = self.transformer(
+            x, y, mask=mask,
+            active_mask=seq_active_mask,
+            kv_active_mask=seq_kv_active_mask,
+        )
 
         x = x[:, :h * w].contiguous()   # drop register tokens
 

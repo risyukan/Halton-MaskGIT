@@ -149,6 +149,23 @@ class HaltonSampler(object):
         except ValueError:
             cache_refresh_n = 0
 
+        # KV cache refresh cadence (independent of FFN partial-update).
+        # HALTON_KV_REFRESH_N semantics:
+        #   N missing / "" / <=0 : KV cache disabled (vit_kv_active_mask=None always)
+        #   N = 1                : refresh every gated step (sanity = vanilla forward)
+        #   N >= 2               : every N-th gated step passes all-True kv_mask
+        #                          to overwrite cache with fresh K/V; other N-1
+        #                          steps pass partial mask (active = U_t ∪ U_{t-1}
+        #                          ∪ still-masked) so committed-age≥2 tokens use
+        #                          cached K/V.
+        # Sync recommendation: set HALTON_KV_REFRESH_N == HALTON_CACHE_REFRESH_N
+        # so KV and FFN cache refresh on the same gated steps (cache miss 集中
+        # 爆发, 整体开销低于错开 refresh)。
+        try:
+            kv_refresh_n = int(os.environ.get("HALTON_KV_REFRESH_N", "0"))
+        except ValueError:
+            kv_refresh_n = 0
+
         # Build the Halton mask if not already created
         if self.basic_halton_mask is None:
             self.basic_halton_mask = self.build_halton_mask(trainer.input_size)
@@ -157,6 +174,9 @@ class HaltonSampler(object):
         # 清空各 Block 的 FFN delta 缓存, 避免上一次 __call__ 的残留影响。
         if hasattr(trainer.vit, "clear_ffn_cache"):
             trainer.vit.clear_ffn_cache()
+        # 同上, 清空各 Attention 的 KV cache buffer。
+        if hasattr(trainer.vit, "clear_kv_cache"):
+            trainer.vit.clear_kv_cache()
         l_codes = []   # intermediate predicted codes
         l_U_t = []     # per-step newly-released token mask  (U_t)
         l_M_t = []     # per-step cumulative released mask   (M_t)
@@ -188,6 +208,7 @@ class HaltonSampler(object):
             prev_r = 0
             prev_U_t = None  # U_t from the previous step (for active-mask union)
             gated_step_counter = 0  # counts steps that fall inside the partial-update gate
+            kv_gated_step_counter = 0  # independent KV-cache counter; sync 时与上者一致
             for index in bar:
                 # Compute the number of tokens to predict
                 ratio = ((index + 1) / self.step)
@@ -232,6 +253,32 @@ class HaltonSampler(object):
                     # else: leave vit_active_mask=None so all blocks run the
                     # full-FFN branch (active_mask=None) and refresh the cache.
 
+                # KV cache mask (独立于 FFN partial_update; 同一个 step gate 5..30).
+                # Active = U_t ∪ U_{t-1} ∪ still-masked
+                #   - U_t: 本步刚释放, input id 正在翻转 → 必须 fresh
+                #   - U_{t-1}: 上一步刚释放, age=1, layer-0 K/V drift = 1.5 (mask→id) → 必须 fresh
+                #   - still-masked: drift 比 cache target 高 40% → 不进 cache
+                # 等价于: cache target = committed-age≥2 = NOT(active 中任一项).
+                # 注意 (code == mask_value) 在 step 开始时 ⇔ U_t ∪ still-masked,
+                # 因为 code 在每步 forward 之后才更新, 此时 U_t 位仍是 mask_value。
+                vit_kv_active_mask = None
+                if kv_refresh_n >= 1 and 5 <= index < 31:
+                    kv_is_refresh = (kv_gated_step_counter % kv_refresh_n == 0)
+                    kv_gated_step_counter += 1
+                    if kv_is_refresh:
+                        # All-True ⇒ fresh K/V for all positions, cache 被覆盖。
+                        vit_kv_active_mask = torch.ones(
+                            nb_sample, trainer.input_size, trainer.input_size,
+                            dtype=torch.bool, device=trainer.args.device,
+                        )
+                    else:
+                        code_is_mask = (code == trainer.args.mask_value)
+                        if prev_U_t is not None:
+                            kv_active = code_is_mask | prev_U_t.to(trainer.args.device)
+                        else:
+                            kv_active = code_is_mask
+                        vit_kv_active_mask = kv_active
+
                 # Choose softmax temperature
                 _temp = self.temperature[index] ** self.temp_pow
                 if index < self.temp_warmup:
@@ -242,12 +289,17 @@ class HaltonSampler(object):
                         torch.cat([vit_active_mask, vit_active_mask], dim=0)
                         if vit_active_mask is not None else None
                     )
+                    kvm_cat = (
+                        torch.cat([vit_kv_active_mask, vit_kv_active_mask], dim=0)
+                        if vit_kv_active_mask is not None else None
+                    )
                     with trainer.autocast:
                         logit = trainer.vit(
                             torch.cat([code.clone(), code.clone()], dim=0),
                             torch.cat([labels, labels], dim=0),
                             torch.cat([~drop, drop], dim=0),
                             active_mask=am_cat,
+                            kv_active_mask=kvm_cat,
                         )
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     logit = (1 + self.w) * logit_c - self.w * logit_u
@@ -256,6 +308,7 @@ class HaltonSampler(object):
                         logit = trainer.vit(
                             code.clone(), labels, ~drop,
                             active_mask=vit_active_mask,
+                            kv_active_mask=vit_kv_active_mask,
                         )
 
                 # Compute probabilities using softmax

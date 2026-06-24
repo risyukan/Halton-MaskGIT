@@ -13,10 +13,10 @@ import matplotlib.pyplot as plt
 # numerically equivalent to the full-update baseline (FID 6.101, speedup 1.000×).
 # ∞ uses the txt partial_no_refresh value 7.5441 for consistency with the
 # other points.
-N_LABELS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '∞']
-X        = list(range(10))               # equal spacing on x-axis
+N_LABELS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '13', '26', '∞']
+X        = list(range(12))               # equal spacing on x-axis
 FID      = [6.101, 6.1334, 6.0542, 6.0163, 6.0311,
-            6.0416, 6.0186, 6.096, 6.109, 7.5441]
+            6.0416, 6.0186, 6.096, 6.109, 6.3115, 6.8941, 7.5441]
 
 # --- theoretical FLOPs / speedup model ---
 # Per-block FLOP breakdown (Small model, d=512, seq=576):
@@ -56,7 +56,7 @@ def theoretical_speedup(refresh_n):
 
 
 # refresh interval per point: N=1..9, then 0 (=∞, never refresh)
-REFRESH_N = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
+REFRESH_N = [1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 26, 0]
 SPEEDUP   = [theoretical_speedup(n) for n in REFRESH_N]
 for lbl, spd in zip(N_LABELS, SPEEDUP):
     print(f'  N={lbl:>2}  speedup {spd:.3f}×')

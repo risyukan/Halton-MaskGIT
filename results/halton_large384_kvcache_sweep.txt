@@ -1,0 +1,1 @@
+ffn_N2_kv_N2_sync_refresh                  2.6638   252.944  3:39:55   13/26 refresh, KV active=U_t∪U_{t-1}∪still-masked
