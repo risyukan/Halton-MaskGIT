@@ -1,0 +1,21 @@
+# Halton-MaskGIT — large 384 / cfg=0.5  ATTENTION-delta cache sweep
+#
+# Model    : ImageNet_384_large.pth (H-MaskGIT-L, 480M)
+# Sampler  : halton, step=32, cfg_w=0.5, fp32, seed=42, global_bsize=32, 50000 imgs
+# Partial  : step gate 5..30, layer gate 3..21, active = U_{t-1} ∪ U_t
+# NEW      : HALTON_ATTN_CACHE=1 — attention 也走 active-only (active token 的 Q 对
+#            全 token K/V 做 attention), inactive 位置改用上一步 cached attn delta
+#            (原本写 0), 与 cached_ffn_delta 对称。FFN cache 同时开启。
+# Refresh  : HALTON_CACHE_REFRESH_N — refresh 步同时刷新 attn 与 FFN 两份缓存。
+#
+# 对照 = 同设定但仅 FFN cache (HALTON_ATTN_CACHE 关) 的
+#        results/halton_large384_partialupdate_sweep.txt:
+#          baseline_full_FFN        2.5410
+#          partial_refresh_every_N2 2.665   (13/26)
+#          partial_norefresh        6.0475  (0/26)
+# 比这两行更低 => attn-cache 在该 refresh 设定下净增益为正。
+#
+# columns: config_name  FID  IS  runtime  refresh_ratio
+# ------------------------------------------------------------
+attncache_refresh_every_N2                 2.7001   252.2779 3:14:48   13/26 refresh (50%)
+attncache_no_refresh                       12.7083  143.1311 2:31:15   0/26 refresh (pure partial)

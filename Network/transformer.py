@@ -67,6 +67,11 @@ class Attention(nn.Module):
         self.wo = nn.Linear(num_heads * self.head_dim, embed_dim, bias=bias)
         self.qk_norm = QKNorm(num_heads * self.head_dim)
         self.cache = None
+        # 上一步本 attn 算出的完整 (pre-gate) 注意力输出 delta, 形状 (b, h_w, d)。
+        # 仅在 HALTON_ATTN_CACHE=1 时使用: partial 步里 inactive 位置用它代替 0
+        # (与 Block.cached_ffn_delta 对称)。每个 full 步刷新, 跨 generation 由
+        # Block.clear_ffn_cache 一并清空。
+        self.cached_attn_delta = None
 
     def forward(self, x, mask=None, active_mask=None):
         """
@@ -109,6 +114,10 @@ class Attention(nn.Module):
             proj = self.wo(output)
             if self.dropout > 0. and self.training:
                 proj = F.dropout(proj, self.dropout)
+            # 刷新 attn-delta 缓存: 让随后的 partial 步 / refresh 步在 inactive
+            # 位置有一份全 token 的基线可回退 (对称于 cached_ffn_delta)。
+            if os.environ.get("HALTON_ATTN_CACHE", "0") == "1":
+                self.cached_attn_delta = proj.detach()
             return proj
 
         else:
@@ -140,10 +149,20 @@ class Attention(nn.Module):
             if self.dropout > 0. and self.training:
                 proj = F.dropout(proj, self.dropout)
 
-            # Scatter back into a full-size zero tensor.
-            # Inactive positions stay zero → residual leaves them unchanged by attn.
-            out_full = torch.zeros(b, h_w, proj.shape[-1], device=x.device, dtype=x.dtype)
+            # Inactive 位置的填充:
+            #   有可用缓存 → 取上一步本层的完整 attn delta (与 cached_ffn_delta 对称);
+            #   否则 → 退化为 0 (即原始行为, attn 不更新 inactive 残差)。
+            if (
+                self.cached_attn_delta is not None
+                and self.cached_attn_delta.shape == (b, h_w, proj.shape[-1])
+                and self.cached_attn_delta.dtype == x.dtype
+            ):
+                out_full = self.cached_attn_delta.clone()
+            else:
+                out_full = torch.zeros(b, h_w, proj.shape[-1], device=x.device, dtype=x.dtype)
             out_full[active_mask] = proj.reshape(b * n_active, -1)
+            # 存回合并后的 delta, 供下一步 inactive 位置复用。
+            self.cached_attn_delta = out_full.detach()
             return out_full
 
 
@@ -195,8 +214,11 @@ class Block(nn.Module):
         self.cached_ffn_delta = None
 
     def clear_ffn_cache(self):
-        """采样新一轮生成前调用, 避免跨 generation 串台。"""
+        """采样新一轮生成前调用, 避免跨 generation 串台。
+        同时清空 attention-delta 缓存 (HALTON_ATTN_CACHE 模式): 采样器只调用
+        clear_ffn_cache 这一个钩子, 故两类缓存都在这里一起清。"""
         self.cached_ffn_delta = None
+        self.attn.cached_attn_delta = None
 
     def forward(self, x, cond, mask=None, active_mask=None):
         """
@@ -210,10 +232,19 @@ class Block(nn.Module):
                   delta 存回 self.cached_ffn_delta 供下一步使用。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
-        # Attention: active-only when active_mask is provided, else full update
+        # Attention: 仅在 HALTON_ATTN_CACHE=1 时进入 active-only + cached-delta 模式
+        # (active token 的 Q 对全 token K/V 做 attention, inactive 用上一步缓存);
+        # 默认 (开关关闭) 保持 full update —— baseline 完全不变。
+        attn_active = (
+            active_mask
+            if (active_mask is not None
+                and os.environ.get("HALTON_ATTN_CACHE", "0") == "1")
+            else None
+        )
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
+            active_mask=attn_active,
         )
         # FFN: active-only when active_mask is provided, with cached-delta fill-in
         if active_mask is None:
