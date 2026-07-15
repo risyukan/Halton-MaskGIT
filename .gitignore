@@ -1,5 +1,6 @@
 saved_networks/ImageNet_384_large.pth
 saved_networks/ImageNet_384_base.pth
+saved_networks/ImageNet_384_small.pth
 saved_networks/vq_ds16_c2i.pt
 __pycache__/
 launch/exp/
