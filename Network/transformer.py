@@ -22,6 +22,45 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+# ── partial-update の active token 抽出/書き戻し ─────────────────────────────
+# 以前は bool マスクによる advanced indexing (x[mask] / out[mask] = ...) と
+# int(mask[0].sum().item()) を各 Block / 各 Attention で呼んでいた。どちらも内部で
+# nonzero() ないし D2H コピーを伴い、CUDA ストリームを毎レイヤ同期させるため、
+# CPU が GPU より先行できず kernel launch レイテンシが全て露出していた
+# (24 層 × 32 step × CFG 2 経路 で 1 生成あたり数千回の同期)。
+#
+# 代わりに「昇順の index テンソル (b, k)」を forward の先頭で 1 度だけ作り、
+# 以降は gather / scatter_ だけで済ませる。index は昇順なので結果は bool マスク
+# indexing とビット単位で同一 (nonzero() も行優先の昇順を返すため)。
+def active_idx_from_mask(mask, n_active=None):
+    """(b, n) bool → (b, k) int64 の昇順 index。
+
+    n_active (= 各行の True 数, 全行同一) が CPU 側で既知なら同期は一切起きない。
+    未知の場合のみ 1 回だけ .sum() で取得する (呼び出しは forward あたり 1 回)。
+    """
+    if n_active is None:
+        n_active = int(mask[0].sum())          # ← ここだけ同期 (forward 1 回につき 1 度)
+    # stable な降順 argsort: True(1) が前に集まり、同値内では元の順序が保たれるので
+    # 先頭 k 個がそのまま昇順の active index になる。
+    return mask.to(torch.uint8).argsort(dim=1, descending=True, stable=True)[:, :n_active]
+
+
+def gather_active(x, idx):
+    """(b, n, d) から idx (b, k) の位置を集める → (b, k, d)。x[mask].view(b,k,d) と同値。"""
+    return torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+
+
+def scatter_active(out, idx, src):
+    """out の idx 位置を src (b, k, d) で上書き (in-place)。out[mask] = src と同値。
+
+    bool マスク代入 (index_put_) は dtype を暗黙変換するが scatter_ は一致を要求する。
+    autocast 下では src が bf16 / out が fp32 になりうるので、ここで揃えておく。
+    """
+    if src.dtype != out.dtype:
+        src = src.to(out.dtype)
+    return out.scatter_(1, idx.unsqueeze(-1).expand(-1, -1, out.size(-1)), src)
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim, h_dim, multiple_of=256, bias=False, dropout=0.):
         super().__init__()
@@ -73,17 +112,17 @@ class Attention(nn.Module):
         # Block.clear_ffn_cache 一并清空。
         self.cached_attn_delta = None
 
-    def forward(self, x, mask=None, active_mask=None):
+    def forward(self, x, mask=None, active_idx=None):
         """
-        active_mask: (b, seq_len) bool — when provided, Q is computed only for
+        active_idx: (b, k) int64 — when provided, Q is computed only for those
         active (newly-released) positions; K/V use all positions.
         Inactive positions receive a zero attention delta so the residual stream
-        is not updated via attention.  active_mask must have the same True-count
-        in every row (guaranteed by HaltonSampler's uniform step schedule).
+        is not updated via attention.  Every row must hold the same number of
+        indices (guaranteed by HaltonSampler's uniform step schedule).
         """
         b, h_w, _ = x.shape
 
-        if active_mask is None:
+        if active_idx is None:
             # ── Full update (original behaviour) ──────────────────────────
             xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
             # normalize queries and keys
@@ -122,9 +161,9 @@ class Attention(nn.Module):
 
         else:
             # ── Q-only-active: Q from U_t tokens, K/V from all tokens ─────
-            # active_mask: (b, h_w) bool, uniform True-count across rows
-            n_active = int(active_mask[0].sum().item())
-            x_active = x[active_mask].view(b, n_active, -1)   # (b, n_active, d)
+            # active_idx: (b, n_active) int64, 昇順 (行ごとの個数は一定)
+            n_active = active_idx.size(1)
+            x_active = gather_active(x, active_idx)           # (b, n_active, d)
 
             xq = self.wq(x_active)   # (b, n_active, d)
             xk = self.wk(x)          # (b, h_w,      d)
@@ -160,12 +199,12 @@ class Attention(nn.Module):
                 out_full = self.cached_attn_delta.clone()
             else:
                 out_full = torch.zeros(b, h_w, proj.shape[-1], device=x.device, dtype=x.dtype)
-            out_full[active_mask] = proj.reshape(b * n_active, -1)
+            scatter_active(out_full, active_idx, proj)
             # 存回合并后的 delta, 供下一步 inactive 位置复用。
             self.cached_attn_delta = out_full.detach()
             return out_full
 
-    def forward_active(self, x, active_mask, mask=None):
+    def forward_active(self, x, active_idx, mask=None):
         """Layer-output-cache 方案专用的 attention。
 
         与上面 forward 的 active 分支不同:
@@ -173,11 +212,11 @@ class Attention(nn.Module):
             上一 step 缓存的本层输入, 已经承载在 x 里);
           - 只返回 active token 的 attention 输出 (b, n_active, d), 不做 inactive
             位置的填充, 也不触碰 cached_attn_delta (那是 HALTON_ATTN_CACHE 方案)。
-        active_mask: (b, h_w) bool, 每行 True 数量一致。
+        active_idx: (b, n_active) int64, 昇順。
         """
         b, h_w, _ = x.shape
-        n_active = int(active_mask[0].sum().item())
-        x_active = x[active_mask].view(b, n_active, -1)   # (b, n_active, d)
+        n_active = active_idx.size(1)
+        x_active = gather_active(x, active_idx)           # (b, n_active, d)
 
         xq = self.wq(x_active)   # (b, n_active, d)
         xk = self.wk(x)          # (b, h_w,      d)
@@ -264,13 +303,13 @@ class Block(nn.Module):
         self.attn.cached_attn_delta = None
         self.cached_layer_output = None
 
-    def forward(self, x, cond, mask=None, active_mask=None):
+    def forward(self, x, cond, mask=None, active_idx=None):
         """
-        active_mask: (b, seq_len) bool —
+        active_idx: (b, k) int64 昇順 (Transformer.forward で 1 度だけ構築) —
         当前配置:
-          - Attention: 当 active_mask 不为 None 时进入 active-only 模式
+          - Attention: 当 active_idx 不为 None 时进入 active-only 模式
                        (Q 仅取 active 位置, K/V 取全部 token; 输出仅写回 active 位置)。
-          - FFN: 当 active_mask 不为 None 时只对 active 位置算 FFN;
+          - FFN: 当 active_idx 不为 None 时只对 active 位置算 FFN;
                   inactive 位置不算 FFN, 改为加上上一步同层缓存的 FFN delta
                   (无缓存时退化为 0)。每次 forward 都把本步的完整 (gated)
                   delta 存回 self.cached_ffn_delta 供下一步使用。
@@ -283,9 +322,9 @@ class Block(nn.Module):
         #   (Q 只取 active, K/V 取全部 —— inactive 的 K/V 来自 x 里承载的上一步
         #    本层输入), FFN 也只算 active; inactive 位置直接沿用缓存的整层输出,
         #   最后把缓存里 active 位置更新为本步新算的输出。
-        if active_mask is not None and os.environ.get("HALTON_LAYER_CACHE", "0") == "1":
+        if active_idx is not None and os.environ.get("HALTON_LAYER_CACHE", "0") == "1":
             return self._forward_layer_cache(
-                x, active_mask, mask,
+                x, active_idx, mask,
                 gamma1, beta1, alpha1, gamma2, beta2, alpha2,
             )
 
@@ -293,26 +332,25 @@ class Block(nn.Module):
         # (active token 的 Q 对全 token K/V 做 attention, inactive 用上一步缓存);
         # 默认 (开关关闭) 保持 full update —— baseline 完全不变。
         attn_active = (
-            active_mask
-            if (active_mask is not None
+            active_idx
+            if (active_idx is not None
                 and os.environ.get("HALTON_ATTN_CACHE", "0") == "1")
             else None
         )
         x = x + alpha1.unsqueeze(1) * self.attn(
             modulate(self.ln1(x), gamma1, beta1),
             mask=mask,
-            active_mask=attn_active,
+            active_idx=attn_active,
         )
-        # FFN: active-only when active_mask is provided, with cached-delta fill-in
-        if active_mask is None:
+        # FFN: active-only when active_idx is provided, with cached-delta fill-in
+        if active_idx is None:
             # full-token FFN; 同时刷新缓存
             ff_delta = alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
             x = x + ff_delta
             self.cached_ffn_delta = ff_delta.detach()
         else:
             b, h_w, d = x.shape
-            n_active = int(active_mask[0].sum().item())
-            x_active = x[active_mask].view(b, n_active, d)
+            x_active = gather_active(x, active_idx)                        # (b, n_active, d)
             ff_out = self.ff(modulate(self.ln2(x_active), gamma2, beta2))  # (b, n_active, d)
             active_delta = (alpha2.unsqueeze(1) * ff_out)                  # (b, n_active, d)
 
@@ -326,18 +364,18 @@ class Block(nn.Module):
             else:
                 delta = torch.zeros_like(x)
             # 覆盖 active 位置为本步新算的 delta
-            delta[active_mask] = active_delta.reshape(b * n_active, d)
+            scatter_active(delta, active_idx, active_delta)
 
             x = x + delta
             self.cached_ffn_delta = delta.detach()
 
-        # full-update 步 (active_mask is None) 顺带刷新 layer-output 缓存, 让随后的
+        # full-update 步 (active_idx is None) 顺带刷新 layer-output 缓存, 让随后的
         # partial 步 / refresh 步在 inactive 位置有一份全 token 的整层输出可沿用。
-        if active_mask is None and os.environ.get("HALTON_LAYER_CACHE", "0") == "1":
+        if active_idx is None and os.environ.get("HALTON_LAYER_CACHE", "0") == "1":
             self.cached_layer_output = x.detach()
         return x
 
-    def _forward_layer_cache(self, x, active_mask, mask,
+    def _forward_layer_cache(self, x, active_idx, mask,
                              gamma1, beta1, alpha1, gamma2, beta2, alpha2):
         """HALTON_LAYER_CACHE 方案的 partial forward。
 
@@ -346,14 +384,13 @@ class Block(nn.Module):
         的 K/V 天然来自缓存。
         """
         b, h_w, d = x.shape
-        n_active = int(active_mask[0].sum().item())
 
         # ── Attention: Q 仅 active, K/V 全部; 只拿 active 的注意力输出 ──
         h_norm = modulate(self.ln1(x), gamma1, beta1)                  # (b, h_w, d) 供 K/V
-        attn_active = self.attn.forward_active(h_norm, active_mask, mask)  # (b, n_active, d)
+        attn_active = self.attn.forward_active(h_norm, active_idx, mask)   # (b, n_active, d)
 
         # active 位置做残差; inactive 位置不动 (稍后整块用缓存覆盖)
-        x_active = x[active_mask].view(b, n_active, d)                 # (b, n_active, d)
+        x_active = gather_active(x, active_idx)                        # (b, n_active, d)
         x_active = x_active + alpha1.unsqueeze(1) * attn_active
 
         # ── FFN 只算 active token ──
@@ -371,7 +408,7 @@ class Block(nn.Module):
             # 首个 partial 步还没缓存: inactive 退化为沿用当前输入 x (即上一层此步的
             # 输出), 相当于本层对 inactive 不更新。
             out = x.clone()
-        out[active_mask] = x_active.reshape(b * n_active, d)
+        scatter_active(out, active_idx, x_active)
         self.cached_layer_output = out.detach()
         return out
 
@@ -387,7 +424,7 @@ class TransformerEncoder(nn.Module):
         for blk in self.layers:
             blk.clear_ffn_cache()
 
-    def forward(self, x, cond, mask=None, active_mask=None,
+    def forward(self, x, cond, mask=None, active_idx=None,
                 partial_update_start_layer=3, partial_update_end_layer=21):
         # Layer-level gating (from analyze_ffn_delta_stability):
         #   exclude layer 0 (no prior context) and very top layers — use
@@ -408,7 +445,7 @@ class TransformerEncoder(nn.Module):
                 pass
         for i, block in enumerate(self.layers):
             use_partial = partial_update_start_layer <= i <= partial_update_end_layer #use_partial为True时，表示在第3到第21层之间使用partial_update，即FFN只更新active_mask指定的位置；否则在其他层使用full update，即FFN更新所有位置。
-            x = block(x, cond, mask=mask, active_mask=active_mask if use_partial else None) #active_maskはTransformerEncoderの引数で、Blockのforwardに渡される。use_partialがTrueのとき、active_maskがBlockのforwardに渡され、FFNはactive_maskで指定された位置のみを更新する。use_partialがFalseのとき、active_maskはNoneとしてBlockのforwardに渡され、FFNは全ての位置を更新する。
+            x = block(x, cond, mask=mask, active_idx=active_idx if use_partial else None) #active_idxはTransformerEncoderの引数で、Blockのforwardに渡される。use_partialがTrueのとき、active_idxがBlockのforwardに渡され、FFNはactive_idxで指定された位置のみを更新する。use_partialがFalseのとき、active_idxはNoneとしてBlockのforwardに渡され、FFNは全ての位置を更新する。
         return x
 
 
@@ -478,11 +515,14 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None, active_mask=None):
+    def forward(self, x, y, drop_label, mask=None, active_mask=None, active_nnz=None):
         """
         active_mask: (b, h, w) bool — newly-active token positions for
         partial-update mode (Q-only-active attention).
         Pass None for the standard full-update forward pass.
+        active_nnz: int|None — 各行の active token 数。呼び出し側 (HaltonSampler) が
+        CPU 側で既に知っている値を渡すと、内部の index 構築で device 同期が
+        一切発生しない。None なら forward あたり 1 回だけ .sum() で求める。
         """
         b, h, w = x.size()
         h0, w0 = h, w   # original spatial dims before any proj
@@ -521,11 +561,20 @@ class Transformer(nn.Module):
                 reg_false = torch.zeros(b, self.register, dtype=torch.bool, device=x.device)
                 seq_active_mask = torch.cat([seq_active_mask, reg_false], dim=1)
 
+        # bool マスク → 昇順 index を「forward あたり 1 度だけ」構築する。
+        # 以降 24 層はこの index を gather/scatter で使い回すので、レイヤ毎の
+        # nonzero()/.item() による同期が消える。proj>1 のときは OR プーリングで
+        # 個数が変わりうるので、渡された active_nnz は使わず数え直す。
+        seq_active_idx = None
+        if seq_active_mask is not None:
+            nnz = active_nnz if (active_nnz is not None and self.proj == 1) else None
+            seq_active_idx = active_idx_from_mask(seq_active_mask, nnz)
+
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
             x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask)
+        x = self.transformer(x, y, mask=mask, active_idx=seq_active_idx)
 
         x = x[:, :h * w].contiguous()   # drop register tokens
 

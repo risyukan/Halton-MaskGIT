@@ -45,24 +45,22 @@ from Network.transformer import Block, modulate
 _DELTA_BUFFER: list = []
 
 
-def _patched_block_forward(self, x, cond, mask=None, active_mask=None):
+def _patched_block_forward(self, x, cond, mask=None, active_idx=None):
     """Mirror of Block.forward that also pushes the FFN delta into _DELTA_BUFFER."""
     gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
     x = x + alpha1.unsqueeze(1) * self.attn(
         modulate(self.ln1(x), gamma1, beta1),
         mask=mask,
-        active_mask=active_mask,
+        active_idx=active_idx,
     )
-    if active_mask is None:
+    if active_idx is None:
         ff_out = self.ff(modulate(self.ln2(x), gamma2, beta2))
         delta = alpha2.unsqueeze(1) * ff_out
     else:
-        b, h_w, d = x.shape
-        n_active = int(active_mask[0].sum().item())
-        x_active = x[active_mask].view(b, n_active, d)
-        ff_out = self.ff(modulate(self.ln2(x_active), gamma2, beta2))
+        from Network.transformer import gather_active, scatter_active
+        ff_out = self.ff(modulate(self.ln2(gather_active(x, active_idx)), gamma2, beta2))
         delta = torch.zeros_like(x)
-        delta[active_mask] = (alpha2.unsqueeze(1) * ff_out).reshape(b * n_active, d)
+        scatter_active(delta, active_idx, alpha2.unsqueeze(1) * ff_out)
     _DELTA_BUFFER.append(delta.detach().to(torch.float32).cpu())
     return x + delta
 

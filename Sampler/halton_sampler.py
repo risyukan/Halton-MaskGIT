@@ -215,6 +215,7 @@ class HaltonSampler(object):
                 #   t >= 5  : skip early unstable steps
                 #   t < 31  : last step is computed in full
                 vit_active_mask = None
+                vit_active_nnz = None   # 各行の active token 数 (CPU 側で既知)
                 if partial_update and 5 <= index < 31:
                     # Decide if this gated step is a "refresh" step that runs
                     # full FFN to rewrite cached_ffn_delta for all positions.
@@ -228,6 +229,10 @@ class HaltonSampler(object):
                             active = prev_U_t | U_t
                         else:
                             active = U_t
+                        # active はまだ CPU 上なので、ここでの .sum() は GPU 同期を
+                        # 伴わない。この値を transformer に渡すことで、内部の
+                        # index 構築 (active_idx_from_mask) からも同期が消える。
+                        vit_active_nnz = int(active[0].sum())
                         vit_active_mask = active.to(trainer.args.device)
                     # else: leave vit_active_mask=None so all blocks run the
                     # full-FFN branch (active_mask=None) and refresh the cache.
@@ -248,6 +253,7 @@ class HaltonSampler(object):
                             torch.cat([labels, labels], dim=0),
                             torch.cat([~drop, drop], dim=0),
                             active_mask=am_cat,
+                            active_nnz=vit_active_nnz,
                         )
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     logit = (1 + self.w) * logit_c - self.w * logit_u
@@ -256,6 +262,7 @@ class HaltonSampler(object):
                         logit = trainer.vit(
                             code.clone(), labels, ~drop,
                             active_mask=vit_active_mask,
+                            active_nnz=vit_active_nnz,
                         )
 
                 # Compute probabilities using softmax

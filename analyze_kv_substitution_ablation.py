@@ -91,7 +91,7 @@ CTRL: Optional[AblationController] = None
 # Patched Attention.forward — mirrors the full-update branch, plus substitution
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _patched_attn_forward(self, x, mask=None, active_mask=None):
+def _patched_attn_forward(self, x, mask=None, active_idx=None):
     """Vanilla forward with optional K/V substitution at committed-age>=2 positions.
 
     Substitution is gated by CTRL.apply_k / CTRL.apply_v at (layer, step). When
@@ -100,9 +100,9 @@ def _patched_attn_forward(self, x, mask=None, active_mask=None):
     Then current (possibly substituted) K/V is stored back for the next step —
     this is the "running" cache semantics, errors propagate.
 
-    active_mask must be None: this analyzer only runs the full-update path.
+    active_idx must be None: this analyzer only runs the full-update path.
     """
-    assert active_mask is None, "substitution ablation uses full-update forward"
+    assert active_idx is None, "substitution ablation uses full-update forward"
     assert CTRL is not None, "AblationController not set"
     l = self._layer_idx
     t = CTRL.cur_step

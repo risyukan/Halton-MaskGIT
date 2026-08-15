@@ -50,13 +50,13 @@ _K_BUFFER: list = []
 _V_BUFFER: list = []
 
 
-def _patched_attn_forward(self, x, mask=None, active_mask=None):
+def _patched_attn_forward(self, x, mask=None, active_idx=None):
     """Mirror Attention.forward (full-update branch) and capture xk, xv post-QKNorm.
 
-    Only the active_mask=None branch is used by this analyzer — we never pass
-    active_mask here, so the partial-update branch is intentionally omitted.
+    Only the active_idx=None branch is used by this analyzer — we never pass
+    active_idx here, so the partial-update branch is intentionally omitted.
     """
-    assert active_mask is None, "kv-drift analyzer only runs vanilla full-update"
+    assert active_idx is None, "kv-drift analyzer only runs vanilla full-update"
     b, h_w, _ = x.shape
     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
     xq, xk = self.qk_norm(xq, xk, xv)

@@ -63,10 +63,10 @@ from Network.transformer import Block, modulate
 _DELTA_BUFFER: list = []
 
 
-def _patched_block_forward(self, x, cond, mask=None, active_mask=None):
+def _patched_block_forward(self, x, cond, mask=None, active_idx=None):
     """Mirror of Block.forward that captures the ATTENTION delta.
 
-    We always run the full (active_mask=None) attention + FFN so the residual
+    We always run the full (active_idx=None) attention + FFN so the residual
     stream is identical to vanilla inference; only the attention delta is
     pushed into _DELTA_BUFFER for later cos/drift analysis.
     """
@@ -78,7 +78,7 @@ def _patched_block_forward(self, x, cond, mask=None, active_mask=None):
         mask=mask,
         # force the full-token path so inactive tokens get a real (non-zero)
         # attention output to measure; this analysis is vanilla-only anyway.
-        active_mask=None,
+        active_idx=None,
     )
     _DELTA_BUFFER.append(attn_delta.detach().to(torch.float32).cpu())
     x = x + attn_delta

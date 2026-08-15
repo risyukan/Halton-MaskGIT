@@ -53,12 +53,12 @@ _S = {
 }
 
 
-def _patched_forward(self, x, cond, mask=None, active_mask=None):
+def _patched_forward(self, x, cond, mask=None, active_idx=None):
     """Mirror of Block.forward (attention always fresh; only FFN is probed)."""
     l = self._probe_idx
     gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
     x = x + alpha1.unsqueeze(1) * self.attn(
-        modulate(self.ln1(x), gamma1, beta1), mask=mask, active_mask=None,
+        modulate(self.ln1(x), gamma1, beta1), mask=mask, active_idx=None,
     )
     true_delta = alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x), gamma2, beta2))
 
