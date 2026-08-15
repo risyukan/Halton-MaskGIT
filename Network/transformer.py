@@ -398,11 +398,32 @@ class Block(nn.Module):
         x_active = x_active + alpha2.unsqueeze(1) * ff_out             # 本步本层的新输出
 
         # ── 拼整层输出: inactive 用缓存, active 用新算的; 再写回缓存 ──
-        if (
+        cache_ok = (
             self.cached_layer_output is not None
             and self.cached_layer_output.shape == x.shape
             and self.cached_layer_output.dtype == x.dtype
-        ):
+        )
+        # 既定は「缓存张量を in-place 更新してそのまま本層出力として返す」。
+        # clone を省くことで、每层每 partial 步一次の (b, n, d) 分配 + 全量拷贝が
+        # 消える (large-384/bs8 で約 4 ms/img — fp32 で理論値 4.2 ms/img とほぼ一致)。
+        # 数値は clone 版とビット単位で同一 (compare_cache_equivalence.py で確認)。
+        #
+        # 安全性: 返り値 C_i は次の層に x として渡るだけで、どの経路も x を in-place
+        # 変更しない (x = x + delta は新テンソルを作る)。層 i は C_i に書く前に
+        # x = C_{i-1} を読み終えており、C_i と C_{i-1} は別物なので read-after-write
+        # のハザードもない。
+        # ただし grad が有効だと detach() が storage を共有したまま次 step で書き
+        # 潰され、保存済み activation を壊す。サンプリングは no_grad なので通常は
+        # 該当しないが、念のため grad 有効時は clone にフォールバックする。
+        # HALTON_LAYER_CACHE_CLONE=1 で明示的に clone 版へ戻せる (A/B 用)。
+        use_inplace = (
+            cache_ok
+            and not torch.is_grad_enabled()
+            and os.environ.get("HALTON_LAYER_CACHE_CLONE", "0") != "1"
+        )
+        if use_inplace:
+            out = self.cached_layer_output
+        elif cache_ok:
             out = self.cached_layer_output.clone()
         else:
             # 首个 partial 步还没缓存: inactive 退化为沿用当前输入 x (即上一层此步的

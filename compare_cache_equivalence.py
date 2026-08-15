@@ -12,9 +12,18 @@ a = torch.load(sys.argv[1])
 b = torch.load(sys.argv[2])
 assert a["seed"] == b["seed"] and a["dtype"] == b["dtype"], "seed/dtype 不一致"
 
+# 片方が構型のサブセットでも比較できるよう、共通部分だけを対象にする
+# (verify_cache_equivalence.py の第 3 引数で一部だけ生成した場合など)。
+common = [k for k in a["data"] if k in b["data"]]
+skipped = [k for k in list(a["data"]) + list(b["data"]) if k not in common]
+if skipped:
+    print(f"[skip] 片側にしか無い构型: {', '.join(sorted(set(skipped)))}\n")
+if not common:
+    raise SystemExit("比較できる构型がありません")
+
 print(f"{'config':18s} {'max|dimg|':>12s} {'mean|dimg|':>12s} {'code mismatch':>14s}  verdict")
 ok_all = True
-for k in a["data"]:
+for k in common:
     ia, ib = a["data"][k]["img"], b["data"][k]["img"]
     ca, cb = a["data"][k]["codes"], b["data"][k]["codes"]
     dimg = (ia - ib).abs()

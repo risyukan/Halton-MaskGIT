@@ -52,6 +52,7 @@ HALTON_ENV_KEYS = (
     "HALTON_PARTIAL_UPDATE",
     "HALTON_ATTN_CACHE",
     "HALTON_LAYER_CACHE",
+    "HALTON_LAYER_CACHE_CLONE",
     "HALTON_CACHE_REFRESH_N",
     "HALTON_PARTIAL_START_LAYER",
     "HALTON_PARTIAL_END_LAYER",
@@ -66,6 +67,11 @@ METHODS = {
     "ffn":      dict(partial=True,  attn=False, layer=False, gate=(3, 21)),
     "attn":     dict(partial=True,  attn=True,  layer=False, gate=(3, 21)),
     "layer":    dict(partial=True,  attn=False, layer=True,  gate=(0, 23)),
+    # layer cache の旧実装 (キャッシュを毎回 clone する版)。既定の layer とは
+    # 数値的に完全等価 (compare_cache_equivalence.py で確認済み) で、clone の
+    # コストだけが違う。同一プロセス内で round-robin 比較すると <1% でも見える。
+    "layer_clone": dict(partial=True, attn=False, layer=True, gate=(0, 23),
+                        clone=True),
 }
 
 VIT_SIZES = {   # hidden_dim, depth, heads —— 与 Trainer/cls_trainer.transformer_size 一致
@@ -93,6 +99,7 @@ class Config:
         self.partial = spec["partial"]
         self.attn = spec["attn"]
         self.layer = spec["layer"]
+        self.force_clone = spec.get("clone", False)
         self.gate = gate if gate is not None else spec["gate"]
 
     @property
@@ -110,6 +117,7 @@ class Config:
         os.environ["HALTON_PARTIAL_UPDATE"] = "1" if self.partial else "0"
         os.environ["HALTON_ATTN_CACHE"] = "1" if self.attn else "0"
         os.environ["HALTON_LAYER_CACHE"] = "1" if self.layer else "0"
+        os.environ["HALTON_LAYER_CACHE_CLONE"] = "1" if self.force_clone else "0"
         os.environ["HALTON_CACHE_REFRESH_N"] = str(self.refresh_n)
         if self.gate is None:
             os.environ.pop("HALTON_PARTIAL_START_LAYER", None)
