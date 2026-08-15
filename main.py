@@ -50,7 +50,10 @@ def main(args):
         maskgit.fit()
 
     eval_sampler = maskgit.sampler
-    m = maskgit.eval(sampler=eval_sampler, num_images=50_000, save_exemple=False, compute_pr=False,
+    # 论文数值一律用默认的 50k; HALTON_EVAL_NUM_IMAGES 仅用于管线冒烟测试
+    # (改动前后确认能跑通再启动长时间 sweep), 不要用它产出论文数字。
+    num_images = int(os.environ.get("HALTON_EVAL_NUM_IMAGES", 50_000))
+    m = maskgit.eval(sampler=eval_sampler, num_images=num_images, save_exemple=False, compute_pr=False,
                      split="Test", mode="c2i", data=args.data.split("_")[0])
     
     if maskgit.args.is_master:
