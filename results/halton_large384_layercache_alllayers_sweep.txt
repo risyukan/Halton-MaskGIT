@@ -1,0 +1,4 @@
+# config                                   FID      IS       runtime   notes
+layercache_alllayers_N2                    2.6953   252.249  3:01:11   13/26 refresh (50%)
+layercache_alllayers_N4                    3.1822   238.6963 2:33:01   ~7/26 refresh (25%)
+layercache_alllayers_norefresh             10.7726  153.9373 2:00:03   0/26 refresh (pure partial)

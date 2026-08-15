@@ -149,7 +149,7 @@ class Attention(nn.Module):
             if self.dropout > 0. and self.training:
                 proj = F.dropout(proj, self.dropout)
 
-            # Inactive 位置的填充:
+            # Inactive 位置的填充: (HALTON_ATTN_CACHE 方案)
             #   有可用缓存 → 取上一步本层的完整 attn delta (与 cached_ffn_delta 对称);
             #   否则 → 退化为 0 (即原始行为, attn 不更新 inactive 残差)。
             if (
@@ -164,6 +164,43 @@ class Attention(nn.Module):
             # 存回合并后的 delta, 供下一步 inactive 位置复用。
             self.cached_attn_delta = out_full.detach()
             return out_full
+
+    def forward_active(self, x, active_mask, mask=None):
+        """Layer-output-cache 方案专用的 attention。
+
+        与上面 forward 的 active 分支不同:
+          - Q 只对 active token 计算, K/V 对全部 token 计算 (inactive 的 K/V 来自
+            上一 step 缓存的本层输入, 已经承载在 x 里);
+          - 只返回 active token 的 attention 输出 (b, n_active, d), 不做 inactive
+            位置的填充, 也不触碰 cached_attn_delta (那是 HALTON_ATTN_CACHE 方案)。
+        active_mask: (b, h_w) bool, 每行 True 数量一致。
+        """
+        b, h_w, _ = x.shape
+        n_active = int(active_mask[0].sum().item())
+        x_active = x[active_mask].view(b, n_active, -1)   # (b, n_active, d)
+
+        xq = self.wq(x_active)   # (b, n_active, d)
+        xk = self.wk(x)          # (b, h_w,      d)
+        xv = self.wv(x)          # (b, h_w,      d)
+
+        xq = self.qk_norm.query_norm(xq).to(xv)
+        xk = self.qk_norm.key_norm(xk).to(xv)
+
+        xq = xq.view(b, n_active, self.n_local_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(b, h_w,      self.n_local_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(b, h_w,      self.n_local_heads, self.head_dim).transpose(1, 2)
+
+        attn_mask = mask.view(b, 1, 1, h_w) if mask is not None else None
+        output = F.scaled_dot_product_attention(
+            xq, xk, xv, attn_mask,
+            dropout_p=self.dropout if self.training else 0.
+        )  # (b, heads, n_active, head_dim)
+
+        output = output.transpose(1, 2).contiguous().view(b, n_active, -1)
+        proj = self.wo(output)   # (b, n_active, d)
+        if self.dropout > 0. and self.training:
+            proj = F.dropout(proj, self.dropout)
+        return proj
 
 
 class RMSNorm(nn.Module):
@@ -212,13 +249,20 @@ class Block(nn.Module):
         # 上一步本 layer 计算出的 (gated) FFN delta, 用于在 inactive 位置上代替 0。
         # 形状 (b, h_w, d); shape mismatch 时自动重置。
         self.cached_ffn_delta = None
+        # 上一步本 layer 的完整输出 (residual stream), 形状 (b, h_w, d)。
+        # 仅在 HALTON_LAYER_CACHE=1 时使用: partial 步里 inactive 位置直接沿用它,
+        # active 位置用本步重算的输出覆盖 (与 cached_ffn_delta 的 delta 缓存不同,
+        # 这里缓存的是整层输出本身)。
+        self.cached_layer_output = None
 
     def clear_ffn_cache(self):
         """采样新一轮生成前调用, 避免跨 generation 串台。
-        同时清空 attention-delta 缓存 (HALTON_ATTN_CACHE 模式): 采样器只调用
-        clear_ffn_cache 这一个钩子, 故两类缓存都在这里一起清。"""
+        同时清空 attention-delta 缓存 (HALTON_ATTN_CACHE 模式) 与 layer-output
+        缓存 (HALTON_LAYER_CACHE 模式): 采样器只调用 clear_ffn_cache 这一个钩子,
+        故三类缓存都在这里一起清。"""
         self.cached_ffn_delta = None
         self.attn.cached_attn_delta = None
+        self.cached_layer_output = None
 
     def forward(self, x, cond, mask=None, active_mask=None):
         """
@@ -232,6 +276,19 @@ class Block(nn.Module):
                   delta 存回 self.cached_ffn_delta 供下一步使用。
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
+
+        # ── Layer-output-cache 方案 (HALTON_LAYER_CACHE=1) ──────────────────
+        # 与 ffn/attn cache 互斥: 开启后 partial 步走这里, 上面两类 cache 不参与。
+        # 机制: 缓存整层输出, 下一 step 只重算 active token
+        #   (Q 只取 active, K/V 取全部 —— inactive 的 K/V 来自 x 里承载的上一步
+        #    本层输入), FFN 也只算 active; inactive 位置直接沿用缓存的整层输出,
+        #   最后把缓存里 active 位置更新为本步新算的输出。
+        if active_mask is not None and os.environ.get("HALTON_LAYER_CACHE", "0") == "1":
+            return self._forward_layer_cache(
+                x, active_mask, mask,
+                gamma1, beta1, alpha1, gamma2, beta2, alpha2,
+            )
+
         # Attention: 仅在 HALTON_ATTN_CACHE=1 时进入 active-only + cached-delta 模式
         # (active token 的 Q 对全 token K/V 做 attention, inactive 用上一步缓存);
         # 默认 (开关关闭) 保持 full update —— baseline 完全不变。
@@ -273,7 +330,50 @@ class Block(nn.Module):
 
             x = x + delta
             self.cached_ffn_delta = delta.detach()
+
+        # full-update 步 (active_mask is None) 顺带刷新 layer-output 缓存, 让随后的
+        # partial 步 / refresh 步在 inactive 位置有一份全 token 的整层输出可沿用。
+        if active_mask is None and os.environ.get("HALTON_LAYER_CACHE", "0") == "1":
+            self.cached_layer_output = x.detach()
         return x
+
+    def _forward_layer_cache(self, x, active_mask, mask,
+                             gamma1, beta1, alpha1, gamma2, beta2, alpha2):
+        """HALTON_LAYER_CACHE 方案的 partial forward。
+
+        输入 x: active 位置承载本步重算的上一层输出, inactive 位置承载上一步缓存
+        的上一层输出 (由上层 _forward_layer_cache 构造)。K/V 用整个 x, 因此 inactive
+        的 K/V 天然来自缓存。
+        """
+        b, h_w, d = x.shape
+        n_active = int(active_mask[0].sum().item())
+
+        # ── Attention: Q 仅 active, K/V 全部; 只拿 active 的注意力输出 ──
+        h_norm = modulate(self.ln1(x), gamma1, beta1)                  # (b, h_w, d) 供 K/V
+        attn_active = self.attn.forward_active(h_norm, active_mask, mask)  # (b, n_active, d)
+
+        # active 位置做残差; inactive 位置不动 (稍后整块用缓存覆盖)
+        x_active = x[active_mask].view(b, n_active, d)                 # (b, n_active, d)
+        x_active = x_active + alpha1.unsqueeze(1) * attn_active
+
+        # ── FFN 只算 active token ──
+        ff_out = self.ff(modulate(self.ln2(x_active), gamma2, beta2))  # (b, n_active, d)
+        x_active = x_active + alpha2.unsqueeze(1) * ff_out             # 本步本层的新输出
+
+        # ── 拼整层输出: inactive 用缓存, active 用新算的; 再写回缓存 ──
+        if (
+            self.cached_layer_output is not None
+            and self.cached_layer_output.shape == x.shape
+            and self.cached_layer_output.dtype == x.dtype
+        ):
+            out = self.cached_layer_output.clone()
+        else:
+            # 首个 partial 步还没缓存: inactive 退化为沿用当前输入 x (即上一层此步的
+            # 输出), 相当于本层对 inactive 不更新。
+            out = x.clone()
+        out[active_mask] = x_active.reshape(b * n_active, d)
+        self.cached_layer_output = out.detach()
+        return out
 
 
 class TransformerEncoder(nn.Module):
