@@ -184,6 +184,14 @@ class HaltonSampler(object):
             else:
                 halton_mask = self.basic_halton_mask.clone().unsqueeze(0).expand(nb_sample, trainer.input_size ** 2, 2)
 
+            # step gate の開始位置 (step=32 -> 5 で従来と完全一致)。
+            # HALTON_STEP_GATE_START で明示指定も可能 (ablation 用)。
+            _gs = os.environ.get("HALTON_STEP_GATE_START")
+            if _gs:
+                gate_start = int(_gs)
+            else:
+                gate_start = max(1, int(round(5 * self.step / 32)))
+
             bar = tqdm(range(self.step), leave=False) if verbose else range(self.step)
             prev_r = 0
             prev_U_t = None  # U_t from the previous step (for active-mask union)
@@ -212,11 +220,16 @@ class HaltonSampler(object):
                 # (consecutive U_t / U_{t-1} are disjoint by Halton construction,
                 #  so per-row True-count stays uniform across the batch).
                 # Step-level gating (from analyze_ffn_delta_stability):
-                #   t >= 5  : skip early unstable steps
-                #   t < 31  : last step is computed in full
+                #   t >= gate_start : skip early unstable steps
+                #   t <  step - 1   : last step is computed in full
+                # gate_start は総ステップ数に比例させる (step=32 で 5 = 従来値)。
+                # 早期ステップが不安定なのは「まだ decode 済みトークンが少ない」
+                # ためで、これは絶対ステップ番号ではなく進行率で決まる。step を
+                # 減らすと 1 ステップあたりの decode 量が増えるので、固定の 5 だと
+                # step=16 では全体の 31% を除外してしまい step 間で比較にならない。
                 vit_active_mask = None
                 vit_active_nnz = None   # 各行の active token 数 (CPU 側で既知)
-                if partial_update and 5 <= index < 31:
+                if partial_update and gate_start <= index < self.step - 1:
                     # Decide if this gated step is a "refresh" step that runs
                     # full FFN to rewrite cached_ffn_delta for all positions.
                     is_refresh = (

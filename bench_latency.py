@@ -167,12 +167,15 @@ def theoretical_macs(cfg, input_size, register, d, depth, codebook):
     head_macs = img_tok * d * codebook
     adaln_macs = depth * 6 * d * d          # 每层 adaLN 的 cond->6d (per-sample)
 
+    # step gate は Sampler/halton_sampler.py と同じ式 (step=32 -> 5..30)
+    gate_start = max(1, int(round(5 * cfg.step / 32)))
+
     total = 0
     gated_counter = 0
     actives = []
     for t in range(cfg.step):
         k = None
-        if cfg.partial and 5 <= t < 31:
+        if cfg.partial and gate_start <= t < cfg.step - 1:
             is_refresh = cfg.refresh_n >= 1 and (gated_counter % cfg.refresh_n == 0)
             gated_counter += 1
             if not is_refresh:
