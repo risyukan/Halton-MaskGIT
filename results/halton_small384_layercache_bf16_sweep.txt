@@ -1,0 +1,53 @@
+# Halton-MaskGIT — small-384 / layer-output cache / bfloat16 sweep
+#
+# Model      : ImageNet_384_small.pth (hidden=512/12L/6H,  ~78M)
+# Method     : HALTON_LAYER_CACHE=1 (每层缓存整层输出; partial 步只重算 active
+#              token, Q 取 active / K/V 取全部, FFN 只算 active; inactive 位置沿用
+#              缓存的整层输出, 缓存原地更新)。ffn/attn cache 均关闭。
+# Sampler    : halton, step=32, cfg_w=1.0, sm_temp=1.0, sm_temp_min=1.0,
+#              temp_warmup=1, sched_pow=2, top_k=-1
+# dtype      : bfloat16
+# GPUs       : 4 (DDP), global_bsize=32
+# num_images : 50000
+# seed       : 42
+# ref stats  : saved_networks/ImageNet_256_train_stats.pt
+# step gate  : partial_update active in halton steps 5..30 (前 5 步/最后 1 步全量)
+# layer gate : 0..11 (全 12 层)
+# eval cmd   : bash launch/run_layercache_bf16_sweep.sh small
+#
+# config 说明:
+#   baseline  = partial_update 关闭 (全 token 更新), FID / latency 的分母
+#   N<k>      = 每 k 个 gated step 全量刷新一次 (N1 每个 gated step 都刷, 计算量 == baseline)
+#   norefresh = 完全不刷新 (纯 partial)
+#
+# latency 见 results/latency_small384_layercache_bf16.csv
+#   (单卡 A6000, batch 8, transformer-only, 与本表同 cfg_w / 同 layer gate)
+#
+# columns: config  FID  IS  runtime  notes
+# ------------------------------------------------------------
+baseline       6.1017    240.9085   0:52:46   reference (partial_update=False)
+N1             6.1017    240.9085   0:52:42   every 1 gated steps
+N2             6.1449    240.0309   0:43:56   every 2 gated steps
+N3             6.142     237.8675   0:41:09   every 3 gated steps
+N4             6.1884    235.4584   0:39:56   every 4 gated steps
+N5             6.2165    233.8531   0:39:07   every 5 gated steps
+N6             6.2679    230.5372   0:38:26   every 6 gated steps
+norefresh      9.9727    167.3953   0:35:23   0/26 refresh (pure partial)
+
+# ==== SUMMARY (FID + latency) ====
+#
+# dFID      = FID - baseline FID
+# spd_vit   = transformer-only 加速比   (单卡 A6000 / batch 8 / bf16)
+# spd_e2e   = 端到端加速比 (含 VQGAN decode 与采样器开销, 同上环境)
+# spd_eval  = 本表 runtime 之比 (4 GPU DDP + Inception 特征提取, 仅供交叉验证)
+# theo      = 理论 MACs 比
+#
+# config          FID     dFID   spd_vit   spd_e2e  spd_eval     theo
+# baseline     6.1017  +0.0000    1.000x    1.000x    1.000x   1.000x
+# N1           6.1017  +0.0000    1.000x    1.000x    1.001x   1.000x
+# N2           6.1449  +0.0432    1.294x    1.198x    1.201x   1.384x
+# N3           6.1420  +0.0403    1.423x    1.275x    1.282x   1.570x
+# N4           6.1884  +0.0867    1.496x    1.316x    1.321x   1.684x
+# N5           6.2165  +0.1148    1.540x    1.341x    1.349x   1.749x
+# N6           6.2679  +0.1662    1.579x    1.360x    1.373x   1.815x
+# norefresh    9.9727  +3.8710    1.830x    1.487x    1.491x   2.251x

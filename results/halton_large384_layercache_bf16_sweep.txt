@@ -25,3 +25,29 @@
 #
 # columns: config  FID  IS  runtime  notes
 # ------------------------------------------------------------
+baseline       2.5527    254.955    2:39:51   reference (partial_update=False)
+N1             2.5527    254.955    2:40:01   every 1 gated steps
+N2             2.7126    251.3603   2:03:51   every 2 gated steps
+N3             2.9366    244.3023   1:52:16   every 3 gated steps
+N4             3.1709    239.2052   1:46:44   every 4 gated steps
+N5             3.4576    233.6749   1:44:05   every 5 gated steps
+N6             3.8222    226.9064   1:40:57   every 6 gated steps
+norefresh      10.7181   154.8647   1:27:00   0/26 refresh (pure partial)
+
+# ==== SUMMARY (FID + latency) ====
+#
+# dFID      = FID - baseline FID
+# spd_vit   = transformer-only 加速比   (单卡 A6000 / batch 8 / bf16)
+# spd_e2e   = 端到端加速比 (含 VQGAN decode 与采样器开销, 同上环境)
+# spd_eval  = 本表 runtime 之比 (4 GPU DDP + Inception 特征提取, 仅供交叉验证)
+# theo      = 理论 MACs 比
+#
+# config          FID     dFID   spd_vit   spd_e2e  spd_eval     theo
+# baseline     2.5527  +0.0000    1.000x    1.000x    1.000x   1.000x
+# N1           2.5527  +0.0000    1.000x    1.000x    0.999x   1.000x
+# N2           2.7126  +0.1599    1.335x    1.296x    1.291x   1.447x
+# N3           2.9366  +0.3839    1.491x    1.427x    1.424x   1.679x
+# N4           3.1709  +0.6182    1.584x    1.503x    1.498x   1.826x
+# N5           3.4576  +0.9049    1.636x    1.545x    1.536x   1.911x
+# N6           3.8222  +1.2695    1.687x    1.587x    1.583x   2.000x
+# norefresh   10.7181  +8.1654    2.017x    1.846x    1.837x   2.624x
