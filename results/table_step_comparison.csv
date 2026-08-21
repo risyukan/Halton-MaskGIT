@@ -1,0 +1,14 @@
+method,steps,refresh,fid,is,ms_per_img,speedup,pareto
+Baseline (no cache),32,—,2.5527,254.9550,761.7,1.000,1
+Baseline (no cache),24,—,3.1563,237.2977,579.6,1.314,0
+Baseline (no cache),20,—,4.1407,221.6773,488.5,1.559,0
+Baseline (no cache),16,—,6.1043,198.3414,397.8,1.915,0
+"Layer cache (ours), 32 steps",32,N = 2,2.7126,251.3603,587.8,1.296,1
+"Layer cache (ours), 32 steps",32,N = 3,2.9366,244.3023,534.2,1.426,1
+"Layer cache (ours), 32 steps",32,N = 4,3.1709,239.2052,507.0,1.502,1
+"Layer cache (ours), 32 steps",32,N = 5,3.4576,233.6749,493.1,1.545,1
+"Layer cache (ours), 32 steps",32,N = 6,3.8222,226.9064,480.2,1.586,0
+"Layer cache (ours), 32 steps",32,no refresh,10.7181,154.8647,412.9,1.845,0
+Layer cache + fewer steps,24,N = 2,3.5880,229.4424,461.9,1.649,1
+Layer cache + fewer steps,20,N = 2,4.9822,209.2297,386.7,1.970,1
+Layer cache + fewer steps,16,N = 2,8.6432,175.4536,322.5,2.362,1
