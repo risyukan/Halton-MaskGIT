@@ -19,3 +19,15 @@
 # ------------------------------------------------------------
 step32   baseline    2.5527    254.955    2:39:51   no cache (from layercache_bf16_sweep)
 step32   N2          2.7126    251.3603   2:03:51   layer cache, refresh every 2 (from layercache_bf16_sweep)
+step20   baseline    4.1407    221.6773   2:44:33*  no cache  (*runtime 受他人负载抢占, 不可用; FID 不受影响)
+step20   N2          4.9822    209.2297   1:21:29   layer cache, refresh every 2
+step16   baseline    6.1043    198.3414   1:23:16   no cache
+step16   N2          8.6432    175.4536   1:07:47   layer cache, refresh every 2
+step24   baseline    3.1563    237.2977   2:01:32   no cache
+step24   N2          3.588     229.4424   1:37:30   layer cache, refresh every 2
+
+# 注: runtime 列是 4 GPU DDP + Inception 的墙钟时间, 仅供交叉验证;
+#     论文延迟一律以 results/latency_large384_steps_bf16.csv (单卡, batch 8) 为准。
+#     2026-08-17 14:10~23:19 期间机器被其他负载抢占, step24 两个配置因 NCCL 集合
+#     超时失败 (已于 08-20 重跑), step20/baseline 的 runtime 被拖长约 1.6 倍。
+#     FID/IS 与速度无关, 未受影响。
