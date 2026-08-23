@@ -22,6 +22,35 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+# ---------------------------------------------------------------------------
+# Env helpers for the inference-time cache switches.
+# All new behaviour is opt-in: with nothing exported the module behaves exactly
+# like the original baseline.
+# ---------------------------------------------------------------------------
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default) == "1"
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim, h_dim, multiple_of=256, bias=False, dropout=0.):
         super().__init__()
@@ -72,6 +101,15 @@ class Attention(nn.Module):
         # (与 Block.cached_ffn_delta 对称)。每个 full 步刷新, 跨 generation 由
         # Block.clear_ffn_cache 一并清空。
         self.cached_attn_delta = None
+        # ── LazyMAR Token Cache (HALTON_LAZY_CACHE=1) ─────────────────────
+        # 本层上一次"新鲜计算"得到的 K / V, 形状 (b, heads, seq, head_dim)。
+        # 对应 LazyMAR 的 cache_dic['cache'][layer]['k'/'v']: partial step 里只
+        # 为 active token 重算 K/V 并 scatter 进这两个 buffer, attention 仍然对
+        # 全长 K/V 做 —— 双向 self-attention 的上下文因此保持完整。
+        self.cached_k = None
+        self.cached_v = None
+        # 缓存不可用 (首次 / 形状-dtype 不匹配) 的次数, 供测试断言为 0。
+        self.lazy_kv_miss = 0
 
     def forward(self, x, mask=None, active_mask=None):
         """
@@ -202,6 +240,85 @@ class Attention(nn.Module):
             proj = F.dropout(proj, self.dropout)
         return proj
 
+    # ------------------------------------------------------------------
+    # LazyMAR Token Cache primitives
+    # ------------------------------------------------------------------
+    def lazy_kv_full(self, h):
+        """为全部 token 计算 K/V 并整体刷新缓存。
+
+        用于 lazy 区间的入口层 —— 该层的输入来自"全量更新"的下层, 所有 token 都
+        变了, 缓存里的 K/V 对谁都不再有效, 必须全量重算。
+
+        h -> (b, N, d): 已经过 ln1 + modulate 的输入。
+        返回 (xk, xv), 形状均为 (b, heads, N, head_dim)。
+        """
+        b, n, _ = h.shape
+        xk = self.qk_norm.key_norm(self.wk(h))
+        xv = self.wv(h)
+        xk = xk.to(xv)
+        xk = xk.view(b, n, self.n_local_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(b, n, self.n_local_heads, self.head_dim).transpose(1, 2)
+        self.cached_k, self.cached_v = xk, xv
+        return xk, xv
+
+    def lazy_kv_partial(self, h_act, active_idx, seq_len):
+        """只为 active token 计算 K/V, scatter 进全长缓存, 返回全长 K/V。
+
+        对 inactive token 而言, 本层的输入自上次重算以来没有变过 (它的残差流被
+        冻结在缓存里), 所以缓存中的 K/V 就是"它此刻应有的 K/V"在该近似下的定义
+        值 —— 这正是 LazyMAR 的 masked_scatter_ 语义。
+
+        h_act      -> (b, k, d)  已 ln1+modulate 的 active 行
+        active_idx -> (b, k)     升序位置下标
+        返回 (b, heads, seq_len, head_dim) 的全长 K/V。
+        """
+        b, k, _ = h_act.shape
+        xk = self.qk_norm.key_norm(self.wk(h_act))
+        xv = self.wv(h_act)
+        xk = xk.to(xv)
+        xk = xk.view(b, k, self.n_local_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(b, k, self.n_local_heads, self.head_dim).transpose(1, 2)
+
+        if k == seq_len:
+            # 全量步: 等价于整体刷新, 且与 baseline 逐位一致。
+            self.cached_k, self.cached_v = xk, xv
+            return xk, xv
+
+        shape = (b, self.n_local_heads, seq_len, self.head_dim)
+        for name, ref in (("cached_k", xk), ("cached_v", xv)):
+            cur = getattr(self, name)
+            if (cur is None or tuple(cur.shape) != shape
+                    or cur.dtype != ref.dtype or cur.device != ref.device):
+                setattr(self, name, torch.zeros(shape, dtype=ref.dtype, device=ref.device))
+                self.lazy_kv_miss += 1
+
+        idx = active_idx[:, None, :, None].expand(b, self.n_local_heads, k, self.head_dim)
+        self.cached_k.scatter_(2, idx, xk)
+        self.cached_v.scatter_(2, idx, xv)
+        return self.cached_k, self.cached_v
+
+    def lazy_attend(self, h_act, xk, xv, mask=None):
+        """Q 只取 active token, K/V 用全长 —— active token 的注意力上下文完整。
+
+        h_act -> (b, k, d) 已 ln1+modulate 的 active 行
+        xk/xv -> (b, heads, N, head_dim)
+        返回 (b, k, d) 的 attention 输出 (已过 wo)。
+        """
+        b, k, _ = h_act.shape
+        xq = self.qk_norm.query_norm(self.wq(h_act)).to(xv)
+        xq = xq.view(b, k, self.n_local_heads, self.head_dim).transpose(1, 2)
+
+        attn_mask = mask.view(b, 1, 1, xk.size(2)) if mask is not None else None
+        output = F.scaled_dot_product_attention(
+            xq, xk, xv, attn_mask,
+            dropout_p=self.dropout if self.training else 0.
+        )
+        output = output.transpose(1, 2).contiguous().view(b, k, -1)
+        proj = self.wo(output)
+        if self.dropout > 0. and self.training:
+            proj = F.dropout(proj, self.dropout)
+        return proj
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5, linear=True, bias=True):
@@ -263,6 +380,10 @@ class Block(nn.Module):
         self.cached_ffn_delta = None
         self.attn.cached_attn_delta = None
         self.cached_layer_output = None
+        # LazyMAR Token Cache 的 per-layer K/V
+        self.attn.cached_k = None
+        self.attn.cached_v = None
+        self.attn.lazy_kv_miss = 0
 
     def forward(self, x, cond, mask=None, active_mask=None):
         """
@@ -375,6 +496,50 @@ class Block(nn.Module):
         self.cached_layer_output = out.detach()
         return out
 
+    # ------------------------------------------------------------------
+    # LazyMAR Token Cache
+    # ------------------------------------------------------------------
+    def forward_lazy(self, x, cond, active_idx, seq_len, mask=None, select_fn=None,
+                     gather_x=False):
+        """LazyMAR 风格的 block forward: 残差流只保留 active token。
+
+        三种模式:
+          active_idx is None  (V-打分模式下 lazy 区间的入口层)
+              x 是全长 (b, N, C)。K/V 为全部 token 新鲜计算并整体刷新缓存,
+              然后调用 select_fn(xv) 决定本步的 active 集合 —— 对应 LazyMAR 在
+              decoder layer 3 用 V 的余弦相似度做 _prune_tokens。
+          active_idx 已给定 + gather_x=True  (forced-only 模式的入口层)
+              active 集合在进任何层之前就定死了 (= U_t ∪ U_{t-1} ∪ register),
+              不需要打分, 于是入口层也不必算全长 K/V: 这里先把 active 行从全长
+              x 里 gather 出来, 之后与区间内其它层完全一样。
+          active_idx 已给定 + gather_x=False  (区间内的后续层)
+              x 已经是 (b, k, C) 的 active 行。K/V 只为 active 行重算并 scatter
+              进全长缓存, attention 仍对全长 K/V 做。
+
+        返回 (x_act, active_idx), x_act 形状 (b, k, C)。
+        """
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.mlp(cond).chunk(6, dim=1)
+
+        if active_idx is None:
+            assert select_fn is not None, "entry layer needs a select_fn"
+            h = modulate(self.ln1(x), gamma1, beta1)            # (b, N, C)
+            xk, xv = self.attn.lazy_kv_full(h)                  # (b, H, N, dh)
+            active_idx = select_fn(xv)                          # (b, k)
+            idx_c = active_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))
+            h_act = torch.gather(h, 1, idx_c)                   # (b, k, C)
+            x_act = torch.gather(x, 1, idx_c)                   # (b, k, C)
+        else:
+            if gather_x:
+                idx_c = active_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))
+                x = torch.gather(x, 1, idx_c)                   # (b, N, C) -> (b, k, C)
+            x_act = x                                           # (b, k, C)
+            h_act = modulate(self.ln1(x_act), gamma1, beta1)
+            xk, xv = self.attn.lazy_kv_partial(h_act, active_idx, seq_len)
+
+        x_act = x_act + alpha1.unsqueeze(1) * self.attn.lazy_attend(h_act, xk, xv, mask=mask)
+        x_act = x_act + alpha2.unsqueeze(1) * self.ff(modulate(self.ln2(x_act), gamma2, beta2))
+        return x_act, active_idx
+
 
 class TransformerEncoder(nn.Module):
     def __init__(self, dim, depth, heads, mlp_dim, dropout=0.):
@@ -382,13 +547,51 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(Block(dim, heads, mlp_dim, dropout=dropout))
+        # ── LazyMAR Token Cache 的 encoder 级状态 ──────────────────────────
+        # lazy 区间出口层的完整输出 (b, N, C): partial 步结束时 inactive 行从这里
+        # 取回上一步的值, active 行写入本步新算的值 (对应 LazyMAR 的
+        # _unprune_tokens, 但用缓存回填而不是填 0)。
+        self.lazy_restore_cache = None
+        # 本步 lazy partial 前向选中的 active 下标 (b, k), 仅 partial 步非 None。
+        # Transformer.forward 的 head 靠它决定只算哪些行 —— 放在这里而不是重新
+        # 由 active_mask 推一遍, 是因为打分模式 (r<1) 的 active 集合是在 encoder
+        # 内部选出来的, 外面看不到。
+        self.lazy_last_active_idx = None
+        self.lazy_stats = self._new_lazy_stats()
+
+    @staticmethod
+    def _new_lazy_stats():
+        return {"lazy_calls": 0, "full_calls": 0, "partial_calls": 0,
+                "active_sum": 0, "token_sum": 0,
+                "partial_active_sum": 0, "partial_token_sum": 0,
+                "score_miss": 0, "restore_miss": 0, "forced_nonuniform": 0,
+                "scored_calls": 0, "forced_only_calls": 0,
+                "head_partial_calls": 0, "head_full_calls": 0, "head_miss": 0}
 
     def clear_ffn_cache(self):
         for blk in self.layers:
             blk.clear_ffn_cache()
+        self.lazy_restore_cache = None
+        self.lazy_last_active_idx = None
+        self.lazy_stats = self._new_lazy_stats()
+
+    def get_lazy_stats(self):
+        """返回本次 generation 的 LazyMAR Token Cache 统计 (供测试 / 消融读取)。"""
+        stats = dict(self.lazy_stats)
+        stats["kv_miss"] = sum(int(blk.attn.lazy_kv_miss) for blk in self.layers)
+        n = stats["token_sum"]
+        # 全部 step 平均 (含被 gate 排除的全量步) —— 反映整体算力占比
+        stats["mean_active_ratio"] = (stats["active_sum"] / n) if n else float("nan")
+        # 只统计 partial 步 —— 直接对应 HALTON_LAZY_CACHE_RATIO 的预算
+        pn = stats["partial_token_sum"]
+        stats["partial_active_ratio"] = (stats["partial_active_sum"] / pn) if pn else float("nan")
+        return stats
 
     def forward(self, x, cond, mask=None, active_mask=None,
-                partial_update_start_layer=3, partial_update_end_layer=21):
+                partial_update_start_layer=3, partial_update_end_layer=21,
+                cfg_pair=False):
+        self.lazy_last_active_idx = None    # 只对本次 forward 有效, 先清掉
+
         # Layer-level gating (from analyze_ffn_delta_stability):
         #   exclude layer 0 (no prior context) and very top layers — use
         #   partial_update only in the stable mid-stack: start ≤ i ≤ end.
@@ -406,9 +609,213 @@ class TransformerEncoder(nn.Module):
                 partial_update_end_layer = int(_e)
             except ValueError:
                 pass
+
+        # ── LazyMAR Token Cache (HALTON_LAZY_CACHE=1) ─────────────────────
+        # 与既有的 ffn/attn/layer cache 三个方案互斥, 便于做公平对比。
+        if _env_flag("HALTON_LAZY_CACHE"):
+            if _env_flag("HALTON_LAYER_CACHE") or _env_flag("HALTON_ATTN_CACHE"):
+                raise RuntimeError(
+                    "HALTON_LAZY_CACHE 与 HALTON_LAYER_CACHE / HALTON_ATTN_CACHE 互斥, "
+                    "请只开启其中一个方案。"
+                )
+            # lazy 区间默认覆盖 *全部* 层: forced-only 模式不再需要靠底层几层去
+            # 算 V 的相似度, 而 layer 0 的输入对 inactive token 而言逐位没变
+            # (code 只在 U_{t-1} 处被改写, 已在强制集合里), 缓存的 K/V 精确有效。
+            # 顺序: HALTON_LAZY_*_LAYER > HALTON_PARTIAL_*_LAYER > 全部层。
+            l_start = _env_int("HALTON_LAZY_START_LAYER",
+                               _env_int("HALTON_PARTIAL_START_LAYER", 0))
+            l_end = _env_int("HALTON_LAZY_END_LAYER",
+                             _env_int("HALTON_PARTIAL_END_LAYER", len(self.layers) - 1))
+            return self._forward_lazy(
+                x, cond, mask, active_mask, l_start, l_end, cfg_pair,
+            )
+
         for i, block in enumerate(self.layers):
             use_partial = partial_update_start_layer <= i <= partial_update_end_layer #use_partial为True时，表示在第3到第21层之间使用partial_update，即FFN只更新active_mask指定的位置；否则在其他层使用full update，即FFN更新所有位置。
             x = block(x, cond, mask=mask, active_mask=active_mask if use_partial else None) #active_maskはTransformerEncoderの引数で、Blockのforwardに渡される。use_partialがTrueのとき、active_maskがBlockのforwardに渡され、FFNはactive_maskで指定された位置のみを更新する。use_partialがFalseのとき、active_maskはNoneとしてBlockのforwardに渡され、FFNは全ての位置を更新する。
+        return x
+
+    # ------------------------------------------------------------------
+    # LazyMAR Token Cache
+    # ------------------------------------------------------------------
+    def _lazy_budget(self, seq_len, forced_mask):
+        """本步要重算的 token 数 k。
+
+        HALTON_LAZY_CACHE_RATIO = 被"缓存复用"的 token 比例 r ∈ [0, 1]:
+            k = ceil((1 - r) * N)
+        r = 1 (默认) → k = 0 → 预算被强制集合撑到 n_forced, 即"只重算当前步和
+            上一步解码的 token (+register)", 不需要任何 V 相似度打分。
+        r = 0  → k = N → 全部重算 → 与 baseline 逐位一致 (方案关闭时的语义)。
+        0 < r < 1 → 强制集合之外还有名额, 由 _lazy_select 的 V 余弦打分来填。
+
+        forced_mask is None 表示这是一个全量步 (采样器没给 active_mask), 无条件
+        k = N, 借此刷新所有缓存 —— 对应 LazyMAR 的 global_force_fresh。
+        """
+        if forced_mask is None:
+            return seq_len
+        ratio = _env_float("HALTON_LAZY_CACHE_RATIO", 1.0)
+        ratio = min(max(ratio, 0.0), 1.0)
+        k = int(math.ceil((1.0 - ratio) * seq_len))
+        # 必须装得下强制重算集合 (U_t ∪ U_{t-1} ∪ register), 否则会用陈旧 logit
+        # 去 commit 本步的 token。
+        n_forced = int(forced_mask.sum(dim=1).max().item())
+        return max(1, min(seq_len, max(k, n_forced)))
+
+    def _lazy_select(self, xv, prev_v, forced_mask, budget, cfg_pair):
+        """挑出本步要重算的 token, 返回升序下标 (b, k)。
+
+        两条路径:
+          budget == |forced|  (r = 1, 默认)
+              名额刚好等于强制集合 —— 打分再怎么排也只能选出这同一批 token,
+              所以完全跳过 V 余弦, 直接由 forced_mask 取下标。此时 xv 可以是
+              None: 调用方连入口层的全长 K/V 都不必算。
+          budget >  |forced|  (r < 1)
+              判据 = 入口层 V 相对上一 decoding step 的余弦变化量 (LazyMAR 的
+              做法): 变化越大越该重算。强制集合直接置 +inf 排在最前, 其余名额
+              按变化量从大到小填满 —— 固定名额而非阈值, 保证每行 active 数一致。
+        """
+        if xv is not None:
+            b, _, n, _ = xv.shape
+            device = xv.device
+        else:
+            b, n = forced_mask.shape
+            device = forced_mask.device
+
+        def _all():
+            return torch.arange(n, device=device).unsqueeze(0).expand(b, n)
+
+        if forced_mask is None:
+            # 全量步: 不需要打分, 直接全选。
+            return _all()
+
+        # ── forced-only: 名额被强制集合占满, 无需打分 ────────────────────
+        counts = forced_mask.sum(dim=1)
+        n_forced = int(counts.max().item())
+        if budget <= n_forced:
+            if int(counts.min().item()) != n_forced:
+                # 每行强制数不一致 → 没法拼成规整的 (b, k)。Halton 构造下不会
+                # 发生 (U_t / U_{t-1} 的大小与行无关), 计数并退化成全量重算。
+                self.lazy_stats["forced_nonuniform"] += 1
+                return _all()
+            # nonzero 按行优先、列升序返回 → 每行天然是升序下标。
+            return forced_mask.nonzero(as_tuple=False)[:, 1].view(b, n_forced)
+
+        if prev_v is None or prev_v.shape != xv.shape or prev_v.device != xv.device:
+            # 没有可比的上一步 V (generation 的第一个 lazy 步): 退化成全量重算,
+            # 安全但不省算力。gate 正常时不该发生, 计数供测试断言。
+            self.lazy_stats["score_miss"] += 1
+            return _all()
+
+        # fp32 打分: bf16 下近乎相同的两个 1024 维向量做余弦会丢掉判别位。
+        cos = F.cosine_similarity(xv.float(), prev_v.float(), dim=-1).mean(dim=1)  # (b, N)
+        score = 1.0 - cos
+
+        if cfg_pair and b % 2 == 0:
+            # batch 布局是 [cond ; uncond], 两半 token 输入完全相同, 只有类别条件
+            # 不同。让两半选同一批 token, 否则 CFG 相减时会引入两套不同的近似误差。
+            half = b // 2
+            shared = 0.5 * (score[:half] + score[half:])
+            score = torch.cat([shared, shared], dim=0)
+
+        score = score.masked_fill(forced_mask, float("inf"))
+        idx = score.topk(budget, dim=1).indices
+        idx, _ = torch.sort(idx, dim=1)      # 升序: 与 boolean-index 的顺序一致
+        return idx
+
+    def _lazy_restore(self, x_act, active_idx, b, n, c):
+        """把 active 行写回全长残差流, inactive 行取缓存中上一步的值。
+
+        对应 LazyMAR 的 _unprune_tokens —— 区别是那里把 inactive 位置填 0 (因为
+        MAR 只在 mask_to_pred 处读 z), 这里必须回填缓存, 因为 Halton 采样器会对
+        全部 576 个位置采样并记入 l_codes。
+        """
+        cache = self.lazy_restore_cache
+        valid = (cache is not None and tuple(cache.shape) == (b, n, c)
+                 and cache.dtype == x_act.dtype and cache.device == x_act.device)
+        if valid:
+            out = cache.clone()
+        else:
+            if active_idx.size(1) < n:
+                self.lazy_stats["restore_miss"] += 1
+            out = torch.zeros(b, n, c, dtype=x_act.dtype, device=x_act.device)
+        out.scatter_(1, active_idx.unsqueeze(-1).expand(-1, -1, c), x_act)
+        self.lazy_restore_cache = out.detach()
+        return out
+
+    def _forward_lazy(self, x, cond, mask, forced_mask, start, end, cfg_pair):
+        """LazyMAR Token Cache 的完整前向。
+
+        forced_mask is None → 全量步: k = N, 所有缓存被整体刷新, 且逐位等于
+        baseline。partial 步 → 只有 [start, end] 区间的 k 个 token 走 Q/FFN,
+        K/V 走全长缓存, 区间外的层照常全量。
+
+        两条选点路径 (见 _lazy_select):
+          budget >  |forced|  (r < 1)  入口层算全长 K/V, 用 V 的余弦变化量补名额;
+                                       start 必须 > 0, 底下几层给它攒材料。
+          budget == |forced|  (r = 1)  不打分, active 直接就是 U_t ∪ U_{t-1} ∪
+                                       register; 入口层不必算全长 K/V, start 可
+                                       以放到 0 —— layer 0 的输入 = tok_emb(code)
+                                       + pos, 与别的 token 无关, 而 code 只在
+                                       U_{t-1} 处变过 (已在强制集合里), 所以
+                                       inactive 行缓存的 K/V 是精确值而非近似。
+        """
+        depth = len(self.layers)
+        end = max(0, min(int(end), depth - 1))
+        start = max(0, min(int(start), end))
+
+        # 1) lazy 区间以下: 永远全量 (它们的输入每步都变, 没有可复用的东西)
+        for i in range(start):
+            x = self.layers[i](x, cond, mask=mask, active_mask=None)
+
+        b, n, c = x.shape
+        budget = self._lazy_budget(n, forced_mask)
+        n_forced = n if forced_mask is None else int(forced_mask.sum(dim=1).max().item())
+
+        if budget > n_forced:
+            # ── 打分模式 (r < 1): 入口层要全长 K/V 才能算 V 的余弦变化量 ──
+            prev_v = self.layers[start].attn.cached_v      # 上一步入口层的 V
+            self.lazy_stats["scored_calls"] += 1
+            x_act, active_idx = self.layers[start].forward_lazy(
+                x, cond, active_idx=None, seq_len=n, mask=mask,
+                select_fn=lambda xv: self._lazy_select(xv, prev_v, forced_mask, budget, cfg_pair),
+            )
+            first = start + 1
+        else:
+            # ── forced-only (r = 1, 默认): active 集合在进层之前就定死了 ──
+            # 不打分 → 入口层不需要全长 K/V → 入口层本身也能只算 active 行,
+            # 这也是 start 可以一路放到 0 的原因。
+            self.lazy_stats["forced_only_calls"] += 1
+            active_idx = self._lazy_select(None, None, forced_mask, budget, cfg_pair) \
+                if forced_mask is not None else \
+                torch.arange(n, device=x.device).unsqueeze(0).expand(b, n)
+            x_act = x
+            first = start
+
+        # 3) 区间内的层: 残差流只带 active 行, K/V 走全长缓存
+        for i in range(first, end + 1):
+            x_act, _ = self.layers[i].forward_lazy(
+                x_act, cond, active_idx=active_idx, seq_len=n, mask=mask,
+                gather_x=(i == first and first == start),
+            )
+
+        # 4) 回填全长
+        x = self._lazy_restore(x_act, active_idx, b, n, c)
+
+        # 5) lazy 区间以上: 全量
+        for i in range(end + 1, depth):
+            x = self.layers[i](x, cond, mask=mask, active_mask=None)
+
+        # partial 步才把 active 下标交给 head; 全量步 head 本来就该全算。
+        self.lazy_last_active_idx = active_idx if forced_mask is not None else None
+
+        k = int(active_idx.size(1))
+        self.lazy_stats["lazy_calls"] += 1
+        self.lazy_stats["full_calls" if forced_mask is None else "partial_calls"] += 1
+        self.lazy_stats["active_sum"] += k
+        self.lazy_stats["token_sum"] += n
+        if forced_mask is not None:
+            self.lazy_stats["partial_active_sum"] += k
+            self.lazy_stats["partial_token_sum"] += n
         return x
 
 
@@ -417,7 +824,12 @@ class Transformer(nn.Module):
 
     def clear_ffn_cache(self):
         """转发到 TransformerEncoder, 清空每层 Block 的 FFN delta 缓存。"""
+        self.lazy_logit_cache = None
         self.transformer.clear_ffn_cache()
+
+    def get_lazy_stats(self):
+        """转发到 TransformerEncoder: LazyMAR Token Cache 的运行统计。"""
+        return self.transformer.get_lazy_stats()
 
     def __init__(self, input_size=16, hidden_dim=768, codebook_size=1024,
                  depth=12, heads=16, mlp_dim=3072, dropout=0., nclass=1000,
@@ -446,6 +858,9 @@ class Transformer(nn.Module):
 
         self.last_norm = AdaNorm(x_dim=hidden_dim, y_dim=hidden_dim)
         self.head = nn.Linear(hidden_dim, codebook_size + 1)
+        # LazyMAR Token Cache: 上一次算过的全长 logit (b, h*w, codebook+1)。
+        # partial 步只为 active 行重算, 其余行从这里取。
+        self.lazy_logit_cache = None
         self.head.weight = self.tok_emb.weight
 
         self.register = register
@@ -478,11 +893,14 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None, active_mask=None):
+    def forward(self, x, y, drop_label, mask=None, active_mask=None, cfg_pair=False):
         """
         active_mask: (b, h, w) bool — newly-active token positions for
         partial-update mode (Q-only-active attention).
         Pass None for the standard full-update forward pass.
+        cfg_pair:    True when the batch is laid out as [cond ; uncond] (the
+        sampler's CFG call).  Only used by the LazyMAR Token Cache, so that both
+        halves select the same token set.
         """
         b, h, w = x.size()
         h0, w0 = h, w   # original spatial dims before any proj
@@ -518,14 +936,17 @@ class Transformer(nn.Module):
 
             if self.register > 0:
                 # Register tokens are never in U_t; they always attend fully.
-                reg_false = torch.zeros(b, self.register, dtype=torch.bool, device=x.device)
-                seq_active_mask = torch.cat([seq_active_mask, reg_false], dim=1)
+                # LazyMAR Token Cache 例外: register 是全局 attention sink, 冻结它
+                # 的代价远大于重算 (只有 self.register 个 token), 故强制 active。
+                reg_val = _env_flag("HALTON_LAZY_CACHE") and _env_flag("HALTON_LAZY_REGISTER_ACTIVE", "1")
+                reg_col = torch.full((b, self.register), reg_val, dtype=torch.bool, device=x.device)
+                seq_active_mask = torch.cat([seq_active_mask, reg_col], dim=1)
 
         if self.register > 0:
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
             x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask)
+        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask, cfg_pair=cfg_pair)
 
         x = x[:, :h * w].contiguous()   # drop register tokens
 
@@ -537,8 +958,48 @@ class Transformer(nn.Module):
                 s1=self.proj, s2=self.proj, b=b, h=h, w=w, c=self.hidden_dim
             ).contiguous()
 
+        # ── LazyMAR Token Cache: head 也只算 active token ─────────────────
+        # last_norm + head 都是逐 token 的 (RMSNorm 沿最后一维, shift/scale 来自
+        # per-sample 的 y), 所以对行的子集算与对全部行算, 每一行的结果相同。
+        # inactive 行此刻的 hidden state 本来就是缓存里上一步的值, 而 y 在整个
+        # 采样循环里不变 —— 于是"拿旧 hidden 现算一遍 logit"和"直接用上一步算好
+        # 的 logit"是同一个数。这一步因此不引入任何新的近似, 只是把注定重复的
+        # 19.3 GFLOPs/step (large-384) 省掉。
+        # 采样器也只在 U_t (⊆ active) 处 commit, inactive 行的 logit 除了写进
+        # l_codes 供可视化外没有别的去处。
+        act_idx = None
+        if (self.proj == 1 and _env_flag("HALTON_LAZY_CACHE")
+                and _env_flag("HALTON_LAZY_HEAD", "1")):
+            act_idx = self.transformer.lazy_last_active_idx
+
+        if act_idx is not None:
+            n_img = x.size(1)
+            # active_idx 升序 → 图像 token 的下标全部排在 register 之前
+            k_img = int((act_idx[0] < n_img).sum().item())
+            if k_img > 0:
+                idx = act_idx[:, :k_img]
+                x_act = torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+                logit_act = self.head(self.last_norm(x_act, y))
+                cache = self.lazy_logit_cache
+                if (cache is not None
+                        and tuple(cache.shape) == (b, n_img, logit_act.size(-1))
+                        and cache.dtype == logit_act.dtype
+                        and cache.device == logit_act.device):
+                    logit = cache.clone()
+                    logit.scatter_(
+                        1, idx.unsqueeze(-1).expand(-1, -1, logit.size(-1)), logit_act)
+                    self.lazy_logit_cache = logit.detach()
+                    self.transformer.lazy_stats["head_partial_calls"] += 1
+                    return logit
+                # 缓存不可用 (首次 / 形状-dtype 不匹配): 退回全量, 安全但不省算力。
+                # gate 正常时不该发生 —— partial 步之前必有全量步把缓存写满。
+                self.transformer.lazy_stats["head_miss"] += 1
+
         x = self.last_norm(x, y)
         logit = self.head(x)
+        if _env_flag("HALTON_LAZY_CACHE"):
+            self.lazy_logit_cache = logit.detach()
+            self.transformer.lazy_stats["head_full_calls"] += 1
 
         return logit
 

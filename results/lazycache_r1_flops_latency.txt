@@ -1,0 +1,79 @@
+# LazyMAR Token Cache — r=1.0 / 全部 24 层 / 无 V 打分 / head 也只算 active
+# 生成于 2026-08-22 16:27:31  |  A6000, fp32, no compile, ImageNet_384_large.pth
+#
+# 方案: active = U_t ∪ U_{t-1} ∪ register (只重算当前步和上一步解码的 token),
+#       不计算 V 的余弦相似度; K/V 走 per-layer 全长缓存, Q/wo/FFN 只算 active;
+#       lazy 覆盖全部 24 层 (打分取消后, 底层不再需要为打分攒材料);
+#       head (last_norm + Linear 1024->16385) 同样只算 active 行 —— 逐 token 运算,
+#       inactive 行的 hidden 本来就是缓存值, 故为等价变换 (已在真实 checkpoint 上
+#       验证 32/32 步 code 与最终 image 逐位相同; HALTON_LAZY_HEAD=0 可关掉)。
+# 复现: python flops_lazy_token_cache.py  /  python bench_latency.py 16 1 5
+
+=============================== 理论 FLOPs ===============================
+
+== 理论 FLOPs | large-384 | depth=24 d=1024 swiglu_h=2816 | seq=577 (576+1 reg) | 32 step ==
+   lazy 层区间 = [0, 23] (共 24/24 层), partial 步 = 5 <= t < 31, r = 1.0 (无 V 打分)
+
+step     mode  active     k/N  FLOPs/step(full=1)
+   0     full     577   1.000               1.000
+   1     full     577   1.000               1.000
+   2     full     577   1.000               1.000
+   3     full     577   1.000               1.000
+   4     full     577   1.000               1.000
+   5  partial      25   0.043               0.044
+   6  partial      24   0.042               0.042
+   7  partial      24   0.042               0.042
+   8  partial      25   0.043               0.044
+   9  partial      25   0.043               0.044
+  10  partial      25   0.043               0.044
+  11  partial      25   0.043               0.044
+  12  partial      26   0.045               0.046
+  13  partial      27   0.047               0.047
+  14  partial      26   0.045               0.046
+  15  partial      26   0.045               0.046
+  16  partial      28   0.049               0.049
+  17  partial      29   0.050               0.051
+  18  partial      29   0.050               0.051
+  19  partial      29   0.050               0.051
+  20  partial      30   0.052               0.053
+  21  partial      31   0.054               0.054
+  22  partial      33   0.057               0.058
+  23  partial      34   0.059               0.060
+  24  partial      35   0.061               0.061
+  25  partial      38   0.066               0.066
+  26  partial      41   0.071               0.072
+  27  partial      44   0.076               0.077
+  28  partial      48   0.083               0.084
+  29  partial      56   0.097               0.098
+  30  partial      70   0.121               0.122
+  31     full     577   1.000               1.000
+
+baseline           :    13059.8 GFLOPs / image (blocks 12431.5, head 618.5)
+lazy r=1 (head 全量):     3533.5 GFLOPs / image (blocks 2905.2, head 618.5)
+lazy r=1 (head lazy):     3058.7 GFLOPs / image (blocks 2905.2, head 143.7)
+
+FLOPs 比例 / 理论加速
+  仅 transformer 层        : 0.2337  → 4.279x
+  端到端, head 全量        : 0.2706  → 3.696x
+  端到端, head 也只算 active: 0.2342  → 4.270x   <<< 默认
+
+partial 步平均 k/N = 0.0569 (26 步), 全量步 6 步
+注: head 只算 active 是等价变换 (逐 token 运算 + inactive 的 hidden 本来就是缓存值),
+    它把端到端加速从 3.696x 提到 4.270x, 已逼近 blocks-only 上限 4.279x。
+
+=============================== 实测 latency =============================
+== latency bench | large-384 | batch=16 | warmup=1 timed=5 | NVIDIA RTX A6000 ==
+
+VQGAN decode      :   24.86 ms/img  (batch   397.8±0.4 ms)
+
+config              total ms/img  transf ms/img img/s(transf)  speedup   theo
+baseline               2033.16        2008.30           0.5    1.000x  1.000x
+dual N=2               1597.59        1572.73           0.6    1.277x  1.344x
+dual no-refresh        1146.11        1121.25           0.9    1.791x  2.045x
+lazy r=1 fullhead       631.43         606.57           1.6    3.311x  3.695x
+                   └ 实测 active: partial 步 k/N=0.0569 (26 步) / 全量步 6 步; 打分=0 kv_miss=0 head(partial/full/miss)=0/32/0
+lazy r=1 +head          581.20         556.34           1.8    3.610x  4.270x
+                   └ 实测 active: partial 步 k/N=0.0569 (26 步) / 全量步 6 步; 打分=0 kv_miss=0 head(partial/full/miss)=26/6/0
+
+注: transf = total - VQGAN decode (各档解码相同)。speedup 以 transformer-only 计;
+    理论列 = 1/FLOPs比例, 见前述 FLOPs 模型。

@@ -1,0 +1,154 @@
+# Halton-MaskGIT — large 384 / cfg=0.5   LazyMAR Token Cache sweep
+#
+# Model    : ImageNet_384_large.pth (H-MaskGIT-L, 480M, 24 层 / 1024 dim / 24^2+1=577 token)
+# Sampler  : halton, step=32, cfg_w=0.5, fp32, seed=42, global_bsize=32, 50000 imgs
+#            —— Halton 顺序 / step gate / 温度 / CFG 与 baseline 完全一致, 未改动。
+# Gate     : step 5..30, layer 3..21  (与 ffn/attn cache sweep 相同, 保证可比)
+#
+# 方案 (HALTON_LAZY_CACHE=1), 迁移自 LazyMAR (ICCV'25):
+#   选点 : active = U_{t-1} ∪ U_t ∪ register ∪ TopK(入口层 V 相对上一步的余弦变化量)
+#          名额 k = ceil((1 - HALTON_LAZY_CACHE_RATIO) * N), 固定名额而非阈值。
+#          对应 LazyMAR 的 _prune_tokens (cos(V_l3(t), V_l3(t-1)) + RETAIN_RATIO)。
+#   执行 : Q 只算 active token; K/V 走 per-layer 全长缓存 (active 行重算后 scatter
+#          回缓存) —— 双向 self-attention 的上下文保持完整; FFN 只算 active token。
+#          对应 LazyMAR 的 DecoderAttention masked_scatter_ + DecoderBlock 剪枝。
+#   回填 : 区间出口层用缓存回填 inactive 行 (LazyMAR 填 0, 这里不能填 0, 因为
+#          Halton 采样器对全部 token 采样并记入 l_codes)。
+#
+# 与既有方案的唯一概念差别 = "哪些 token 被重算":
+#   既有 ffn/attn/layer cache : active = U_{t-1} ∪ U_t, 纯调度决定, 恒为 4~6% token
+#   本方案                    : 调度强制集合 + 内容自适应补足到给定预算, 比例可调
+#
+# 对照 (同 sampler / 同 seed / 同 gate):
+#   baseline (无 cache)                 FID 2.5410  IS 256.15
+#   ffn   cache  N=2 / norefresh        FID 2.665  / 6.0475
+#   attn  cache  N=2 / norefresh        FID 2.7001 / 12.7083
+#   layer cache  N=2 / N=4 / norefresh   FID 2.6953 / 3.1822 / 10.7726
+#
+# 相对耗时实测 (随机权重, batch 4 + CFG, 32 step, 577 token, 24 层, A6000):
+#          baseline 1.00x | ffn cache 1.33x | layer cache 1.67x
+#   lazy r=0.5 1.34x | r=0.75 1.66x | r=0.9 1.95x | r=0.95 2.03x
+#   (lazy 在重算更多 token 的同时更快, 因为 K/V 走显式 per-layer 缓存, 不必每层对
+#    全部 token 重算 wk/wv —— 既有 layer cache 每层都要对 577 个 token 重算 K/V。)
+#   只反映算力, FID 必须用真实 checkpoint 测。
+#
+# !! 用随机权重做任何数值验证时注意: Transformer.initialize_weights 会把每个 Block
+#    的 AdaLN 调制层零初始化 (DiT 风格), 于是 alpha1=alpha2=0, x = x + alpha*(...)
+#    退化成恒等映射, 整个 transformer 什么都不做 —— 那样任何 cache 对比都会平凡
+#    通过。test_lazy_token_cache.make_trainer 会重新随机化这些门, T0 负责守卫。
+#
+# 正确性自检: HALTON_LAZY_CACHE_RATIO=0 时与 baseline 逐位一致 —— 已在真实规模
+#   (24 层 / 1024 dim / 577 token / 32 step / CFG, 479M) 上验证全 32 步 logits /
+#   codes / image 逐位相同。见 python test_lazy_token_cache.py (11/11) 与
+#   python test_cache_regression.py (既有方案 6/6 逐位不变)。
+#   跑 sweep 前建议先跑一次 r=0 确认环境无误。
+#
+# 跑法: LAZY_RATIO=0.9 REFRESH_N=2 bash launch/eval_fid_large384_lazycache.sh
+#
+# columns: config_name  FID  IS  runtime  notes
+# ------------------------------------------------------------
+
+# ============================================================================
+# refresh 周期扫描 — lazy r=1 / 24 层 (L0-23) / lazy head / 无 V 打分
+# 生成于 2026-08-22  |  A6000 x4, fp32, no compile, ImageNet_384_large.pth
+#
+# 配置: HALTON_LAZY_CACHE=1  HALTON_LAZY_CACHE_RATIO=1.0
+#       HALTON_LAZY_START_LAYER=0  HALTON_LAZY_END_LAYER=23  HALTON_LAZY_HEAD=1
+#       active = U_t ∪ U_{t-1} ∪ register, 不打分; K/V per-layer 全长缓存
+# refresh 语义 (Sampler/halton_sampler.py:225-231): gated_step_counter 先判断后自增,
+#       故 refresh 落在 counter = 0, N, 2N, ... —— N=2 -> 13/26, N=4 -> 7/26。
+# 复现: bash launch/run_lazy_refresh_sweep.sh
+#       理论 FLOPs: python flops_lazy_refresh.py
+#       实测 latency: python bench_latency_refresh.py 16 1 5
+# ----------------------------------------------------------------------------
+#
+# 【理论 FLOPs】baseline = 13059.8 GFLOPs/image
+#
+#   N     refresh步  partial步  全量步合计  平均k/N   GFLOPs   FLOPs比   理论加速
+#   none      0         26          6      0.0569   3059.6   0.2343    4.268x
+#   2        13         13         19      0.0587   8069.3   0.6179    1.618x
+#   4         7         19         13      0.0567   5751.0   0.4404    2.271x
+#   8         4         22         10      0.0562   4592.6   0.3517    2.844x
+#   13        2         24          8      0.0577   3837.1   0.2938    3.404x
+#
+# 【实测端到端 latency】batch=16, warmup=1 timed=5, 单卡 A6000
+#   VQGAN decode = 24.92 ms/img (各档相同, 已从 transf 中扣除)
+#
+#   config           total ms/img  transf ms/img  实测加速   理论加速   达成率
+#   baseline            2029.98       2005.06     1.000x    1.000x    100.0%
+#   lazy N=none          581.44        556.52     3.603x    4.268x     84.4%
+#   lazy N=2            1317.02       1292.10     1.552x    1.618x     95.9%
+#   lazy N=4             976.12        951.20     2.108x    2.271x     92.8%
+#   lazy N=8             806.07        781.15     2.567x    2.844x     90.3%
+#   lazy N=13            694.68        669.76     2.994x    3.404x     88.0%
+#
+#   实测 refresh 计数与理论完全一致 (kv_miss=0, head partial/full 计数亦一致):
+#     N=none partial 26 / full 6   | N=2  partial 13 / full 19
+#     N=4    partial 19 / full 13  | N=8  partial 22 / full 10
+#     N=13   partial 24 / full  8
+#
+# 【50k FID】(4x A6000 DDP, global_bsize=32, 50000 imgs, seed=42)
+#   baseline (无 cache) = FID 2.5410 / IS 256.15
+#
+#   N      FID       IS        理论加速   实测加速   eval runtime
+#   2      2.6951    252.31    1.618x     1.552x     2:41:29
+#   4      3.1899    238.04    2.271x     2.108x     2:04:56
+#   8      4.4322    214.80    2.844x     2.567x     1:46:38
+#   13     5.8257    198.09    3.404x     2.994x     1:34:49
+#   none  10.8181    153.50    4.268x     3.603x     1:22:40
+#
+#   -> FID 随 N 单调恶化, 无拐点。要保住 FID≈2.70 只能 N=2。
+#      头条的 3.6x (no-refresh) 对应 FID 10.82, 不可用。
+#
+# ============================================================================
+# 【结论 1】lazy ≡ layer-output cache, 已由 50k FID 证实
+#
+#   同 refresh N / 同 24 层, 两者 FID 逐点重合:
+#     N     layercache   lazy       Δ
+#     2     2.6953       2.6951     0.0002
+#     4     3.1822       3.1899     0.0077
+#     none 10.7726      10.8181     0.0455
+#
+#   机理: AdaLN 的 cond 只有类别嵌入 (Network/transformer.py:909-910, 无 step/time
+#   embedding), 故 gamma/beta/alpha 在 32 步内恒定。于是 layer cache 每层对全部 577
+#   个 token 重算的 K/V, 与 lazy 缓存里那份数在数学上完全相同 —— layer cache 的全长
+#   K/V 重算是纯浪费, 不是"用近似换速度"。
+#   非逐位相同的原因: (a) lazy 强制 register token active (transformer.py:941),
+#   layer cache 不强制; (b) gather/scatter 与 bool-mask 索引的 fp32 非结合性使采样
+#   轨迹发散。统计上等价。
+#
+# 【结论 2】等质量净增益 (同 N 同 FID, batch=16 单卡 A6000 实测)
+#
+#   config              FID(50k)   transf ms/img   speedup    净增益
+#   baseline              2.5410      2007.28      1.000x       —
+#   layercache N=2        2.6953      1556.37      1.290x
+#   lazy       N=2        2.6951      1292.35      1.553x      1.204x
+#   layercache N=4        3.1822      1340.34      1.498x
+#   lazy       N=4        3.1899       951.85      2.109x      1.408x
+#   layercache N=none    10.7726      1090.27      1.841x
+#   lazy       N=none    10.8181       556.26      3.609x      1.960x
+#
+#   实测净增益 > 理论净增益 (N=2: 1.204x 实测 vs 1.12x 理论), 因为 layer cache 每层
+#   每步还要 cached_layer_output.clone() 一份 577x1024 全长张量 + bool-mask 非连续
+#   索引, 这些访存开销不计入 FLOPs; lazy 的 (b,k,C) 连续 gather/scatter 轻得多。
+#
+# 【结论 3】r=1 方案的根本矛盾
+#
+#   lazy 相对 layer cache 的优势只在 partial 步兑现, 优势随 partial 步占比增长:
+#     partial 占比 26/32 (none) -> 净增益 1.960x
+#     partial 占比 19/32 (N=4)  -> 净增益 1.408x
+#     partial 占比 13/32 (N=2)  -> 净增益 1.204x
+#   而 FID 的要求恰好相反 —— 要好 FID 就要多全量步。两个诉求直接冲突。
+#   在可用质量点 (FID 2.695) 上, 等质量净增益只有 1.204x。
+#
+#   下一步唯一还剩的杠杆: rolling refresh (每步额外重算 A 个最陈旧 token,
+#   A=576/S, 成本与周期 S 的全刷相当但陈旧度均匀分布), 针对的正是"周期性全刷让
+#   576 个 token 同步老化、刷新前一刻全体最劣"这个失效模式。
+#
+# columns: config_name  FID  IS  runtime  notes
+# ----------------------------------------------------------------------------
+lazycache_r1.0_N0_L0-23                    10.8181  153.4979 1:22:40   ratio=1.0 refresh_every_0 layers=0..23
+lazycache_r1.0_N2_L0-23                    2.6951   252.3132 2:41:29   ratio=1.0 refresh_every_2 layers=0..23
+lazycache_r1.0_N4_L0-23                    3.1899   238.0405 2:04:56   ratio=1.0 refresh_every_4 layers=0..23
+lazycache_r1.0_N8_L0-23                    4.4322   214.7978 1:46:38   ratio=1.0 refresh_every_8 layers=0..23
+lazycache_r1.0_N13_L0-23                   5.8257   198.0947 1:34:49   ratio=1.0 refresh_every_13 layers=0..23

@@ -154,9 +154,13 @@ class HaltonSampler(object):
             self.basic_halton_mask = self.build_halton_mask(trainer.input_size)
 
         trainer.vit.eval()
-        # 清空各 Block 的 FFN delta 缓存, 避免上一次 __call__ 的残留影响。
-        if hasattr(trainer.vit, "clear_ffn_cache"):
-            trainer.vit.clear_ffn_cache()
+        # 清空各 Block 的缓存 (FFN delta / attn delta / layer output / LazyMAR
+        # K-V), 避免上一次 __call__ 的残留影响。
+        # 注意: DDP 不转发属性访问, 直接 hasattr(trainer.vit, ...) 在多卡 eval 下
+        # 恒为 False —— 缓存会跨 batch 串台。必须先取出 .module。
+        _vit = getattr(trainer.vit, "module", trainer.vit)
+        if hasattr(_vit, "clear_ffn_cache"):
+            _vit.clear_ffn_cache()
         l_codes = []   # intermediate predicted codes
         l_U_t = []     # per-step newly-released token mask  (U_t)
         l_M_t = []     # per-step cumulative released mask   (M_t)
@@ -248,6 +252,7 @@ class HaltonSampler(object):
                             torch.cat([labels, labels], dim=0),
                             torch.cat([~drop, drop], dim=0),
                             active_mask=am_cat,
+                            cfg_pair=True,
                         )
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     logit = (1 + self.w) * logit_c - self.w * logit_u
