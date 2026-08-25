@@ -38,7 +38,8 @@ LAZY_ENVS = ["HALTON_LAZY_CACHE", "HALTON_LAZY_CACHE_RATIO", "HALTON_LAZY_REGIST
              "HALTON_PARTIAL_UPDATE", "HALTON_CACHE_REFRESH_N",
              "HALTON_PARTIAL_START_LAYER", "HALTON_PARTIAL_END_LAYER",
              "HALTON_LAZY_START_LAYER", "HALTON_LAZY_END_LAYER", "HALTON_LAZY_HEAD",
-             "HALTON_LAYER_CACHE", "HALTON_ATTN_CACHE"]
+             "HALTON_LAYER_CACHE", "HALTON_ATTN_CACHE",
+             "HALTON_LAZY_VSIM", "HALTON_LAZY_VSIM_SCHED"]
 
 
 @contextlib.contextmanager
@@ -522,10 +523,10 @@ def t13_layer0_input_frozen_for_inactive():
     seen = []
     orig = T.TransformerEncoder._forward_lazy
 
-    def spy(self, x, cond, mask, forced_mask, start, end, cfg_pair):
+    def spy(self, x, cond, mask, forced_mask, start, end, cfg_pair, **kw):
         seen.append((x.detach().clone(),
                      None if forced_mask is None else forced_mask.clone()))
-        return orig(self, x, cond, mask, forced_mask, start, end, cfg_pair)
+        return orig(self, x, cond, mask, forced_mask, start, end, cfg_pair, **kw)
 
     T.TransformerEncoder._forward_lazy = spy
     try:

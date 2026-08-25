@@ -1,4 +1,4 @@
-"""lazy r=1 / 24 层 / lazy head 在不同 refresh 周期 N 下的理论 FLOPs 与加速比。
+"""lazy r=1 / 全部层 / lazy head 在不同 refresh 周期 N 下的理论 FLOPs 与加速比。
 
 FLOPs 模型与 flops_lazy_token_cache.py 完全一致 (FLOPs = 2 x MACs), 唯一新增的是
 refresh 步的处理 —— 语义严格照抄 Sampler/halton_sampler.py:225-231:
@@ -10,12 +10,23 @@ refresh 步的处理 —— 语义严格照抄 Sampler/halton_sampler.py:225-231
 N=2 -> 13/26 步刷新, N=4 -> 7/26, 与既有 layercache sweep 的 notes 一致。
 refresh 步走 active_mask=None 的全量分支, 与 baseline 单步同价。
 
-用法: python flops_lazy_refresh.py
+模型尺寸取自 Trainer/abstract_trainer.py:transformer_size:
+    small = 512 dim / 12 层 / 6 head   (77.9M)
+    base  = 768 dim / 12 层 / 12 head  (155.1M)
+    large = 1024 dim / 24 层 / 16 head (479.6M)
+lazy 覆盖全部层, 故 depth 只影响总量而不影响 partial/full 的比例结构;
+不同尺寸之间的理论加速差异只来自 head (D x 16385) 与 attention 在总量中的占比。
+
+用法:
+    python flops_lazy_refresh.py              # 三个尺寸都打印
+    python flops_lazy_refresh.py base         # 只打印 base
+被 bench_latency_refresh.py import 时, 先调用 set_size(size) 再用 run()/BASE。
 """
 import math
+import os
+import sys
 
-DEPTH, D = 24, 1024
-MLP_DIM  = 4 * D
+# ── 与尺寸无关的常量 ──────────────────────────────────────────────────────
 GRID     = 384 // 16
 TOK      = GRID * GRID                # 576
 REGISTER = 1
@@ -24,13 +35,20 @@ CODEBOOK = 16384
 STEPS    = 32
 GATE_LO, GATE_HI = 5, 31              # partial 步: GATE_LO <= t < GATE_HI
 
+SIZES = {                             # name -> (depth, hidden_dim)
+    "tiny":  (6, 384),
+    "small": (12, 512),
+    "base":  (12, 768),
+    "large": (24, 1024),
+    "xlarge": (28, 1152),
+}
+
+REFRESH_NS = [0, 2, 3, 4, 8, 13]      # 0 = no refresh
+
 
 def swiglu_hidden(mlp_dim, multiple_of=256):
     h = int(2 * mlp_dim / 3)
     return multiple_of * ((h + multiple_of - 1) // multiple_of)
-
-
-H = swiglu_hidden(MLP_DIM)
 
 
 def lin(n_in, n_out, tokens):
@@ -46,10 +64,21 @@ def block_flops(q_tok, kv_tok, ctx_len):
     return attn + ffn
 
 
-HEAD_FULL  = lin(D, CODEBOOK + 1, TOK)
-ADALN      = DEPTH * lin(D, 6 * D, 1) + lin(D, 2 * D, 1)
-FULL_BLOCK = block_flops(SEQ, SEQ, SEQ)
-FULL_STEP  = FULL_BLOCK * DEPTH + HEAD_FULL + ADALN
+def set_size(size):
+    """把模块级 globals 切到指定尺寸。返回 (depth, dim)。"""
+    global SIZE, DEPTH, D, MLP_DIM, H, HEAD_FULL, ADALN, FULL_BLOCK, FULL_STEP, BASE
+    if size not in SIZES:
+        raise ValueError(f"unknown vit size {size!r}, expect one of {list(SIZES)}")
+    SIZE = size
+    DEPTH, D = SIZES[size]
+    MLP_DIM = 4 * D
+    H = swiglu_hidden(MLP_DIM)
+    HEAD_FULL = lin(D, CODEBOOK + 1, TOK)
+    ADALN = DEPTH * lin(D, 6 * D, 1) + lin(D, 2 * D, 1)
+    FULL_BLOCK = block_flops(SEQ, SEQ, SEQ)
+    FULL_STEP = FULL_BLOCK * DEPTH + HEAD_FULL + ADALN
+    BASE = FULL_STEP * STEPS
+    return DEPTH, D
 
 
 def halton_r(t):
@@ -93,16 +122,26 @@ def run(refresh_n):
     return total, n_refresh, n_partial, (sum(ratios) / len(ratios) if ratios else 0.0)
 
 
-BASE = FULL_STEP * STEPS
+def report(size):
+    set_size(size)
+    print(f"== 理论 FLOPs | lazy r=1 | {size}-384 | {DEPTH}/{DEPTH} 层 | lazy head | 32 step ==")
+    print(f"   depth={DEPTH} d={D} swiglu_h={H} seq={SEQ} | gate = [{GATE_LO}, {GATE_HI})")
+    print(f"   baseline = {BASE/1e9:.1f} GFLOPs/image\n")
+    print(f"{'refresh N':>10s} {'refresh步':>9s} {'partial步':>9s} {'全量步合计':>11s} "
+          f"{'平均k/N':>8s} {'GFLOPs':>9s} {'FLOPs比':>8s} {'理论加速':>9s}")
+    for n in REFRESH_NS:
+        tot, nr, npart, kr = run(n)
+        n_full = STEPS - (GATE_HI - GATE_LO) + nr
+        label = "none" if n == 0 else str(n)
+        print(f"{label:>10s} {nr:>9d} {npart:>9d} {n_full:>11d} "
+              f"{kr:>8.4f} {tot/1e9:>9.1f} {tot/BASE:>8.4f} {BASE/tot:>8.3f}x")
+    print()
 
-print("== 理论 FLOPs | lazy r=1 | large-384 | 24/24 层 | lazy head | 32 step ==")
-print(f"   depth={DEPTH} d={D} swiglu_h={H} seq={SEQ} | gate = [{GATE_LO}, {GATE_HI})")
-print(f"   baseline = {BASE/1e9:.1f} GFLOPs/image\n")
-print(f"{'refresh N':>10s} {'refresh步':>9s} {'partial步':>9s} {'全量步合计':>11s} "
-      f"{'平均k/N':>8s} {'GFLOPs':>9s} {'FLOPs比':>8s} {'理论加速':>9s}")
-for n in [0, 2, 4, 8, 13]:
-    tot, nr, npart, kr = run(n)
-    n_full = STEPS - (GATE_HI - GATE_LO) + nr
-    label = "none" if n == 0 else str(n)
-    print(f"{label:>10s} {nr:>9d} {npart:>9d} {n_full:>11d} "
-          f"{kr:>8.4f} {tot/1e9:>9.1f} {tot/BASE:>8.4f} {BASE/tot:>8.3f}x")
+
+# import 时的默认尺寸 (向后兼容: 老脚本 import 后直接用 run()/BASE 得到 large)
+set_size(os.environ.get("LAZY_VIT_SIZE", "large"))
+
+if __name__ == "__main__":
+    targets = sys.argv[1:] or ["large", "base", "small"]
+    for s in targets:
+        report(s)

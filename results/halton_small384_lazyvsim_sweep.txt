@@ -1,0 +1,111 @@
+# Halton-MaskGIT — small 384 / cfg=1.0   LazyMAR 选点复刻 (HALTON_LAZY_VSIM) refresh sweep
+#
+# Model    : ImageNet_384_small.pth (H-MaskGIT-S, 77.9M, 12 层 / 512 dim / 24^2+1=577 token)
+# Sampler  : halton, step=32, cfg_w=1.0, fp32, seed=42, global_bsize=32, 50000 imgs
+#            sm_temp=1.0 / sm_temp_min=1.0 / temp_warmup=1 / sched_pow=2 / top_k=-1
+# Gate     : step 5..30 走 partial, 前 5 步与最后 1 步恒为全量
+# Layers   : LAZY_START=3 .. LAZY_END=11  (large 版是 L3-23; "从 LazyMAR 的打分层 3
+#            一路用到最后一层"这一语义在 12 层模型上就是 L3-11)
+#
+# 与 large-384 cfg=0.5 的 lazyvsim sweep (results/halton_large384_lazyvsim_sweep.txt)
+# 的差异仅两项: 模型 (1024/24层 -> 512/12层) 与 cfg_w (0.5 -> 1.0)。
+# 选点规则 / 执行机制 / sampler / step / seed / bsize / dtype / 温度 / sched 完全一致。
+#
+# ============================================================================
+# 方案: 只换"选哪些 token 重算", 执行机制与 HALTON_LAZY_CACHE 共用
+# ----------------------------------------------------------------------------
+#   score_i = 1 - cos( V_l(t)_i , V_l(t-1)_i )     l = LAZY_START = 3  (fp32 打分)
+#   active  = TopK_{k_t}(score),  k_t = ceil(rho_t * N)
+#   rho_t   = LazyMAR 的 RETAIN_RATIO_SCHEDULE, 64 步表按生成进度重采样到 32 步
+#   **没有任何强制 token**: U_t / U_{t-1} / register 全部只按 V 的变化量竞争名额。
+#   CFG 两半 ([cond ; uncond]) 共享同一份分数。
+#   执行: Q 只算 active; K/V 走 per-layer 全长缓存; FFN 只算 active; 出口层缓存
+#         回填 inactive 行; head 也只算 active 行。
+#
+# 与 lazycache (r=1, results/halton_small384_lazycache_sweep.txt) 的对照:
+#   lazycache : active = U_t ∪ U_{t-1} ∪ register, 纯调度决定, k/N ≈ 0.057 恒定,
+#               lazy 区间 = 全部 12 层 (L0-11)
+#   lazyvsim  : active = TopK(V 余弦变化量), 内容自适应, k/N = rho_t 随 step 衰减
+#               (partial 步平均 k/N ≈ 0.31), lazy 区间 = L3-11 (层 0..2 每步全量,
+#               给入口层打分攒材料)
+#
+# refresh 语义 (Sampler/halton_sampler.py:225-231): gated_step_counter 先判断后自增,
+#       refresh 落在 counter = 0, N, 2N, ... —— 与 lazycache 逐步一致, 两方案在同一
+#       个 N 下起效的 step 完全相同, 可直接对比。
+#
+# 接口: launch/eval_fid_small384_lazyvsim.sh
+#   HALTON_LAZY_CACHE=1 HALTON_LAZY_VSIM=1 HALTON_LAZY_VSIM_SCHED=lazymar
+#   HALTON_LAZY_START_LAYER=3 HALTON_LAZY_END_LAYER=11 HALTON_CACHE_REFRESH_N=<N>
+#
+# 复现: setsid nohup bash launch/run_lazyvsim_all_sweeps.sh &
+#       (单档: REFRESH_N=3 bash launch/eval_fid_small384_lazyvsim.sh)
+#       理论 FLOPs : python flops_lazy_vsim.py small
+#       实测 latency: python bench_latency_vsim_sweep.py 16 1 5 small
+#                     -> results/latency/bench_vsim_small.txt
+#       正确性     : python test_lazy_vsim.py (9/9)
+# ----------------------------------------------------------------------------
+#
+# 【理论 FLOPs】baseline = 2082.5 GFLOPs/image   (depth=12 d=512 swiglu_h=1536 seq=577)
+#   partial 步成本 = 层0..2 全量 + 入口层(全长 K/V + k 行 Q/FFN) + 层4..11(k 行)
+#                    + lazy head(k 行);  rho_t=1 的 partial 步退化成全量, 完全不省。
+#
+#   N     refresh步  partial步  其中rho=1  全量步合计  平均k/N   GFLOPs   FLOPs比   理论加速
+#   none      0         26          5          6      0.3328   1205.0   0.5786    1.728x
+#   2        13         13          2         19      0.3136   1631.1   0.7832    1.277x
+#   3         9         17          3         15      0.3176   1495.7   0.7182    1.392x
+#   4         7         19          3         13      0.3131   1422.4   0.6830    1.464x
+#   8         4         22          4         10      0.3250   1331.4   0.6393    1.564x
+#   13        2         24          4          8      0.3138   1249.4   0.6000    1.667x
+#
+# 【实测端到端 latency】batch=16, warmup=1 timed=5, 单卡 A6000, fp32, no compile,
+#   ImageNet_384_small.pth, cfg_w=1.0, step=32   (2026-08-25)
+#   复现: python bench_latency_vsim_sweep.py 16 1 5 small
+#   VQGAN decode = 25.09 ms/img (各档相同, 已从 transf 中扣除)
+#
+#   config              total ms/img  transf ms/img   实测加速  理论加速  达成率
+#   baseline                439.99        414.90     1.000x   1.000x   100.0%
+#   lazyvsim N=none         316.43        291.34     1.424x   1.728x    82.4%
+#   lazyvsim N=2            380.06        354.97     1.169x   1.277x    91.5%
+#   lazyvsim N=3            359.78        334.69     1.240x   1.392x    89.0%
+#   lazyvsim N=4            348.56        323.47     1.283x   1.464x    87.6%
+#   lazyvsim N=8            335.04        309.95     1.339x   1.564x    85.6%
+#   lazyvsim N=13           322.72        297.63     1.394x   1.667x    83.6%
+#   —— 同进程测的 lazycache r=1 参照档 (L0-11) ——
+#   lazycache N=none        196.94        171.85     2.414x   4.270x    56.5%
+#   lazycache N=2           322.18        297.09     1.397x   1.619x    86.3%
+#   lazycache N=3           283.66        258.57     1.605x   2.002x    80.1%
+#   lazycache N=4           264.30        239.21     1.734x   2.271x    76.4%
+#   lazycache N=8           235.32        210.23     1.974x   2.844x    69.4%
+#   lazycache N=13          216.31        191.22     2.170x   3.405x    63.7%
+#
+#   (lazycache 各档与 2026-08-24 的 bench_refresh_small 记录一致: N=2 1.397 vs 1.397 /
+#    N=none 2.414 vs 2.426 —— 两次独立 bench 相互印证。)
+#
+#   运行时计数与理论逐项吻合 (kv_miss=0, score_miss=0, head miss=0):
+#     N=none partial 26 / full 6, vsim=26 scored=21   N=2  partial 13 / full 19, scored=11
+#     N=3    partial 17 / full 15, scored=14          N=4  partial 19 / full 13, scored=16
+#     N=8    partial 22 / full 10, scored=18          N=13 partial 24 / full  8, scored=20
+#     (scored < partial 的差额 = rho_t=1 的退化步, 按设计跳过打分)
+#
+#   !! 三个尺寸的达成率对比 (vsim / lazycache):
+#        N        large          base           small
+#        none   94.2 / 84.5   89.0 / 69.9    82.4 / 56.5
+#        2      97.4 / 95.8   94.9 / 91.9    91.5 / 86.3
+#        13     94.6 / 87.9   90.0 / 75.8    83.6 / 63.7
+#      模型越小, FLOPs 越难兑现成 wall-clock —— 但 vsim 每一档都比同尺寸的
+#      lazycache 高 10~26 个百分点: 它的 partial 步要算 ~181 个 token 而 lazycache
+#      只算 ~33 个, kernel 不再小到被 launch 开销和 gather/scatter 访存占住。
+#      代价是省下的 FLOPs 本身少得多, 绝对加速仍然是 lazycache 更高。
+#
+# 【50k FID】(4x A6000 DDP, global_bsize=32, 50000 imgs, seed=42, cfg=1.0)
+#   baseline 参照 = FID 6.101 / IS 241.3234
+#     取自 results/halton_small384_cfg10_partialupdate_sweep.txt 的 partial_refresh_every_N1
+#     (N=1 时每个 gated step 都全量刷新, 与 baseline 数学等价)。
+#   lazycache r=1 参照 (results/halton_small384_lazycache_sweep.txt):
+#     N=none 10.0324/165.85  N=2 6.1403/239.93  N=3 6.1352/238.78
+#     N=4     6.1439/236.35  N=8 6.3922/223.32  N=13 6.9617/210.42
+#
+#   下面的行由 launch/eval_fid_small384_lazyvsim.sh 自动 append。
+#
+# columns: config_name  FID  IS  runtime  notes
+# ----------------------------------------------------------------------------

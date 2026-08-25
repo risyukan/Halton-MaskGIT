@@ -67,7 +67,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=4 \
 
 FID=$(grep -oE "'FID': [0-9.]+" "$LOG" | tail -1 | grep -oE "[0-9.]+$" || echo "NA")
 IS=$(grep -oE "'IS': [0-9.]+"   "$LOG" | tail -1 | grep -oE "[0-9.]+$" || echo "NA")
-RT=$(grep -oE "[0-9]+:[0-9]+:[0-9]+<00:00"  "$LOG" | tail -1 | cut -d'<' -f1 || echo "NA")
+# tqdm 不到 1 小时只打 MM:SS, 超过才打 H:MM:SS —— 两种都要认, 否则 base/small
+# 这种 <1h 的 eval 会记成 NA。
+RT=$(grep -oE "[0-9]+:[0-9]+(:[0-9]+)?<00:00"  "$LOG" | tail -1 | cut -d'<' -f1 || echo "NA")
 
 mkdir -p results
 printf "%-42s %-8s %-8s %-9s %s\n" \

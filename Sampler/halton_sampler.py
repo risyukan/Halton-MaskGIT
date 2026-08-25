@@ -149,6 +149,12 @@ class HaltonSampler(object):
         except ValueError:
             cache_refresh_n = 0
 
+        # V-similarity token selection (HALTON_LAZY_VSIM=1) is the only consumer
+        # of the step index: its recompute ratio decays with the decoding step
+        # (LazyMAR's RETAIN_RATIO_SCHEDULE).  Pass the step only in that mode so
+        # every other model / sampler path keeps its original call signature.
+        lazy_vsim = os.environ.get("HALTON_LAZY_VSIM", "0") == "1"
+
         # Build the Halton mask if not already created
         if self.basic_halton_mask is None:
             self.basic_halton_mask = self.build_halton_mask(trainer.input_size)
@@ -241,6 +247,8 @@ class HaltonSampler(object):
                 if index < self.temp_warmup:
                     _temp *= 0.5  # Reduce temperature during warmup
 
+                step_kw = {"step": index, "total_steps": self.step} if lazy_vsim else {}
+
                 if self.w != 0:  # Model prediction with CFG
                     am_cat = (
                         torch.cat([vit_active_mask, vit_active_mask], dim=0)
@@ -253,6 +261,7 @@ class HaltonSampler(object):
                             torch.cat([~drop, drop], dim=0),
                             active_mask=am_cat,
                             cfg_pair=True,
+                            **step_kw,
                         )
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     logit = (1 + self.w) * logit_c - self.w * logit_u
@@ -261,6 +270,7 @@ class HaltonSampler(object):
                         logit = trainer.vit(
                             code.clone(), labels, ~drop,
                             active_mask=vit_active_mask,
+                            **step_kw,
                         )
 
                 # Compute probabilities using softmax

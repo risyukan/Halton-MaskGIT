@@ -1,0 +1,74 @@
+# Halton-MaskGIT — base 384 / cfg=0.7   LazyMAR Token Cache (lazy r=1) refresh sweep
+#
+# Model    : ImageNet_384_base.pth (H-MaskGIT-B, 155.1M, 12 层 / 768 dim / 24^2+1=577 token)
+# Sampler  : halton, step=32, cfg_w=0.7, fp32, seed=42, global_bsize=32, 50000 imgs
+#            sm_temp=1.0 / sm_temp_min=1.0 / temp_warmup=1 / sched_pow=2 / top_k=-1
+# Gate     : step 5..30 走 partial, 前 5 步与最后 1 步恒为全量
+# 配置     : HALTON_LAZY_CACHE=1  HALTON_LAZY_CACHE_RATIO=1.0  HALTON_LAZY_HEAD=1
+#            HALTON_LAZY_START_LAYER=0  HALTON_LAZY_END_LAYER=11   (= 全部 12 层)
+#            active = U_t ∪ U_{t-1} ∪ register, 不算 V 余弦打分
+#            Q/FFN 只算 active token; K/V 走 per-layer 全长缓存; head 也走 lazy
+#
+# 与 large-384 cfg=0.5 的 lazy sweep (results/halton_large384_lazycache_sweep.txt)
+# 的差异仅两项: 模型 (1024/24层 -> 768/12层) 与 cfg_w (0.5 -> 0.7)。
+# lazy 层区间在两边都是"全部层", sampler / step / seed / bsize / dtype / 温度 /
+# sched 完全一致, 三个尺寸之间严格可比。
+#
+# refresh 语义 (Sampler/halton_sampler.py:225-231): gated_step_counter 先判断后自增,
+#       refresh 落在 counter = 0, N, 2N, ... —— N=2 -> 13/26, N=3 -> 9/26, N=4 -> 7/26。
+#
+# 复现: setsid nohup bash launch/run_lazy_all_sweeps.sh &     (单档: REFRESH_N=3 bash launch/eval_fid_base384_lazycache.sh)
+#       理论 FLOPs : python flops_lazy_refresh.py base
+#       实测 latency: python bench_latency_refresh.py 16 1 5 base     -> results/latency/bench_refresh_base.txt
+# ----------------------------------------------------------------------------
+#
+# 【理论 FLOPs】baseline = 3995.9 GFLOPs/image   (depth=12 d=768 swiglu_h=2048 seq=577)
+#
+#   N     refresh步  partial步  全量步合计  平均k/N   GFLOPs   FLOPs比   理论加速
+#   none      0         26          6      0.0569    936.0   0.2342    4.269x
+#   2        13         13         19      0.0587   2468.9   0.6179    1.619x
+#   3         9         17         15      0.0573   1996.1   0.4995    2.002x
+#   4         7         19         13      0.0567   1759.5   0.4403    2.271x
+#   8         4         22         10      0.0562   1405.1   0.3516    2.844x
+#   13        2         24          8      0.0577   1173.9   0.2938    3.404x
+#
+# 【实测端到端 latency】batch=16, warmup=1 timed=5, 单卡 A6000, 2026-08-24
+#   VQGAN decode = 25.26 ms/img (各档相同, 已从 transf 中扣除)
+#
+#   config           total ms/img  transf ms/img  实测加速   理论加速   达成率
+#   baseline             715.37        690.11     1.000x    1.000x    100.0%
+#   lazy N=none          256.41        231.15     2.986x    4.269x     69.9%
+#   lazy N=2             485.88        460.62     1.498x    1.619x     92.6%
+#   lazy N=3             414.21        388.95     1.774x    2.002x     88.6%
+#   lazy N=4             377.01        351.75     1.962x    2.271x     86.4%
+#   lazy N=8             323.70        298.44     2.312x    2.844x     81.3%
+#   lazy N=13            289.28        264.02     2.614x    3.404x     76.8%
+#
+#   实测 refresh 计数与理论完全一致 (kv_miss=0, head partial/full 计数亦一致):
+#     N=none partial 26 / full 6   | N=2  partial 13 / full 19
+#     N=3    partial 17 / full 15  | N=4  partial 19 / full 13
+#     N=8    partial 22 / full 10  | N=13 partial 24 / full  8
+#
+#   !! 达成率明显低于 large (large 同档为 85.5 / 96.9 / 94.9 / 93.8 / 91.3 / 89.0%)。
+#      原因: base 的 partial 步只有 ~33 个 token x 768 dim x 12 层, 每个 kernel 都
+#      太小, 时间被 kernel launch 与 gather/scatter 的访存占住, 已经不是算力受限。
+#      no-refresh 档最极端 —— 26/32 步都是 partial, 理论 4.269x 只兑现 2.986x。
+#      模型越小, FLOPs 节省越难兑现成 wall-clock。
+#
+# 【50k FID】(4x A6000 DDP, global_bsize=32, 50000 imgs, seed=42)
+#   baseline 参照 = FID 4.202 / IS 255.4643
+#     取自 results/halton_base384_cfg07_partialupdate_sweep.txt 的 partial_refresh_every_N1:
+#     N=1 时每个 gated step 都全量刷新 (26/26), 与 baseline 数学等价, 且此时层区间
+#     设置不影响结果 —— 故可直接当 baseline 用。(README 报告的 base-384 值为 4.15。)
+#
+#   N      FID       IS        理论加速   实测加速   eval runtime
+#   (待填 —— 见文件末尾自动 append 的原始行)
+#
+# columns: config_name  FID  IS  runtime  notes
+# ----------------------------------------------------------------------------
+lazycache_r1.0_N0_L0-11                    9.3592   167.0365 45:43     ratio=1.0 refresh_every_0 layers=0..11
+lazycache_r1.0_N2_L0-11                    4.2211   253.6846 1:11:50   ratio=1.0 refresh_every_2 layers=0..11
+lazycache_r1.0_N3_L0-11                    4.2719   249.5779 1:03:50   ratio=1.0 refresh_every_3 layers=0..11
+lazycache_r1.0_N4_L0-11                    4.3254   245.7137 59:50     ratio=1.0 refresh_every_4 layers=0..11
+lazycache_r1.0_N8_L0-11                    4.7665   230.5057 53:51     ratio=1.0 refresh_every_8 layers=0..11
+lazycache_r1.0_N13_L0-11                   5.5767   214.2957 50:02     ratio=1.0 refresh_every_13 layers=0..11

@@ -1,0 +1,97 @@
+% ============================================================
+\section{Proposed Method}
+\label{sec:method}
+% ============================================================
+
+We propose the \emph{inactive KV cache} for accelerating Halton-MaskGIT decoding. The key observation is that only a small fraction of token positions changes meaningfully between two consecutive decoding steps, while the Transformer re-evaluates all of them at every step. The Halton scheduler predetermines the positions unmasked at every step, so the tokens that require fresh computation are known in advance, without any additional model evaluation. During a cached step, we therefore carry only these active tokens through the Transformer stack and serve every remaining position from a cache. Each block recomputes keys and values only for the active tokens and writes them into a full-length per-layer KV cache, so active queries still attend to the entire sequence; the hidden states and logits of inactive positions are restored from their cached values. Step gating keeps the cache inactive during the unstable initial decoding phase, and periodic cache refresh bounds the error accumulated over later cached steps.
+
+\subsection{Inactive KV Cache}
+\label{sec:active}
+
+\begin{figure*}[t]
+\begin{center}
+\includegraphics[width=0.98\textwidth]{figs/method_overview.pdf}
+\end{center}
+\caption{Overview of the proposed inactive KV cache.
+\textbf{Bottom left:} the active set $A_t$ consists of the positions scheduled for unmasking after the current forward pass, $U_t$ (red), the positions unmasked at the previous step, $U_{t-1}$ (green), and the register tokens. All remaining image-token positions are inactive (gray).
+\textbf{Top left:} on a cached step, the active rows are gathered once before the first block and are the only rows propagated through the stack; inactive rows are restored from the hidden-state cache after the last block, and the output head is evaluated for active rows only.
+\textbf{Right:} inside a block, the query projection, the attention output projection, and the FFN are evaluated only for active tokens. Keys and values are also recomputed only for active tokens and are scattered into a full-length per-layer KV cache, so active queries still attend to the complete sequence.}
+\label{fig:method}
+\end{figure*}
+
+Let $\mathcal{P}$ be the set of image-token positions, $\mathcal{R}$ the register tokens, and $\mathcal{S}=\mathcal{P}\cup\mathcal{R}$ the input sequence of the Transformer, of length $S=|\mathcal{S}|$. Let $U_t\subset\mathcal{P}$ denote the positions that the scheduler unmasks after the forward pass at step $t$. Guided by the analysis in Sec.~\ref{sec:age}, we call a position \emph{active} at step $t$ if it belongs to
+\begin{equation}
+    A_t \;=\; U_t \cup U_{t-1} \cup \mathcal{R},
+    \qquad U_{-1}=\emptyset,
+    \label{eq:active}
+\end{equation}
+and \emph{inactive} otherwise, that is, if it belongs to $I_t=\mathcal{S}\setminus A_t$. The three terms of Eq.~\eqref{eq:active} play distinct roles. Positions in $U_t$ must be recomputed because their logits are consumed at this step. Positions in $U_{t-1}$ must be recomputed exactly once, since their inputs have just changed from the mask token to a sampled code. Register tokens are always recomputed: they act as global attention sinks that every query reads, so freezing them would perturb all attention maps while saving only $|\mathcal{R}|$ token evaluations. Every other position is inactive. We write $k=|A_t|$ for the number of active tokens.
+
+Because the Halton schedule fixes every $U_t$ before decoding begins, $A_t$ is known in advance and requires neither the model's current predictions nor an auxiliary scoring pass. For the 32-step schedule at $384\times384$ resolution ($S=577$), the active ratio $k/S$ averages $5.7\%$ over the cached steps, so more than $94\%$ of the sequence is a candidate for reuse at every such step.
+
+Let $X_t^{(l)}\in\mathbb{R}^{S\times d}$ denote the input of block $l$ at step $t$. On a cached step we gather the active rows once, before the first block,
+\begin{equation}
+    \bar{X}_t^{(0)} \;=\; X_t^{(0)}[A_t] \;\in\; \mathbb{R}^{k\times d},
+    \label{eq:gather}
+\end{equation}
+and propagate only these $k$ rows through the entire stack. Every per-token operation inside a block, namely the query projection, the attention output projection, and the FFN, is therefore evaluated $k$ times instead of $S$ times.
+
+Discarding rows from the residual stream, however, also discards them from the attention context, which a bidirectional Transformer cannot tolerate: an active token must still see the codes that have already been decoded. We resolve this with the \emph{inactive KV cache}. Each block $l$ maintains full-length keys and values $\widetilde{K}^{(l)},\widetilde{V}^{(l)}\in\mathbb{R}^{S\times d}$ that persist across decoding steps. On a cached step, block $l$ projects only its $k$ active rows and scatters the result into the cache,
+\begin{equation}
+    \widetilde{K}^{(l)}_t(i) =
+    \begin{cases}
+        W_K^{(l)}\,\hat{x}^{(l)}_t(i), & i\in A_t,\\[2pt]
+        \widetilde{K}^{(l)}_{t-1}(i),  & i\in I_t,
+    \end{cases}
+    \label{eq:kvcache}
+\end{equation}
+and identically for $\widetilde{V}^{(l)}_t$, where $\hat{x}^{(l)}_t$ is the block input after normalization and adaptive modulation. Attention is then evaluated with $k$ queries against the full-length cache,
+\begin{equation}
+    \bar{Z}^{(l)}_t
+    = \operatorname{softmax}\!\left(
+        \frac{Q\!\left(\hat{x}^{(l)}_{t,A}\right)\widetilde{K}^{(l)\mathsf{T}}_t}{\sqrt{d_h}}
+      \right)\widetilde{V}^{(l)}_t
+    \;\in\; \mathbb{R}^{k\times d},
+    \label{eq:lazyattn}
+\end{equation}
+so each active token still attends to all $S$ positions even though only $k$ keys and values were recomputed. The block then completes the usual gated residual updates on the active rows alone,
+\begin{equation}
+    \bar{Y}^{(l)}_t = \bar{X}^{(l)}_t + \alpha_1 \bar{Z}^{(l)}_t,
+    \qquad
+    \bar{X}^{(l+1)}_t = \bar{Y}^{(l)}_t + \alpha_2 \operatorname{FFN}\!\left(\bar{Y}^{(l)}_t\right),
+    \label{eq:blockupdate}
+\end{equation}
+where $\alpha_1$ and $\alpha_2$ are the adaptive layer-norm gates.
+
+The substitution in Eq.~\eqref{eq:kvcache} is not arbitrary; it is the exact key that the retained state produces. Since a position $i\in I_t$ is not recomputed, its hidden state at block $l$ has not changed since its last recomputation, and $\widetilde{K}^{(l)}_{t-1}(i)$ is precisely the key that this frozen state yields. Reusing it thus adds no error beyond the staleness that freezing the token already implies. At the first block the reuse is exact in a stronger sense: the input is $\operatorname{emb}(c_i)+p_i$, which depends only on position $i$'s own code $c_i$ and index, and codes change only at $U_{t-1}\subset A_t$. The cache can therefore be enabled from the very first block, and no block has to be run at full length in order to keep the cache valid.
+
+After the last block, the active rows are scattered back into a full-length hidden-state cache, while inactive rows keep their stored values,
+\begin{equation}
+    H_t(i) =
+    \begin{cases}
+        \bar{X}^{(L)}_t(i), & i\in A_t,\\[2pt]
+        H_{t-1}(i),         & i\in I_t,
+    \end{cases}
+    \label{eq:restore}
+\end{equation}
+which is required because the sampler draws a token at every position of $\mathcal{P}$. The final normalization and the output head act independently on each token, and their modulation is derived from the class embedding, which is constant throughout the sampling loop. Evaluating them on a subset of rows therefore returns exactly the same value per row as evaluating them on all rows, and we maintain a logit cache updated in the same manner as Eq.~\eqref{eq:restore}. This removes a term of $2Sd|\mathcal{V}|$ per decoding step, which is substantial for a codebook of size $|\mathcal{V}|=16{,}385$, without introducing any approximation whatsoever, since the hidden states behind the reused logits are bit-for-bit unchanged.
+
+Per block, a cached step therefore costs $\Theta(kd^2+kSd)$ instead of $\Theta(Sd^2+S^2d)$: every weight multiplication is restricted to $k$ rows, and the quadratic attention term becomes linear in $k$. Since the reduction is applied to the block as a whole rather than to a single submodule, attention and the FFN are accelerated by the same factor, and only the length of the cached keys and values still scales with $S$. What remains is to determine when reuse is safe, which is the subject of the next two subsections.
+
+\subsection{Step Gating}
+\label{sec:gate}
+
+Block-output reuse is less reliable during the initial decoding phase. As shown in Figure~\ref{fig:consistency_analysis}(a), both $U_{10}$ and $U_{20}$ exhibit comparatively large relative drift in the initial region $t=0$--$5$, even though the two cohorts are unmasked at different later steps. We therefore use \emph{step gating} to separate this globally unstable phase from the subsequent cached phase.
+
+For the 32-step schedule used in this work, we perform full-token recomputation through step~5 and begin cached steps at step~6. We also use full-token recomputation at the final step, $t=31$. Accordingly, layer-output reuse is eligible at steps $6\leq t<31$, except at periodic cache-refresh steps described below. During every eligible cached step, the layer-output cache is applied to all Transformer blocks; we do not use block-specific gating.
+
+Each full-recomputation step also initializes or refreshes every block's cache. Cached steps can therefore reuse valid block outputs produced by the most recent full-recomputation or active-token recomputation.
+
+\subsection{Periodic Cache Refresh}
+\label{sec:refresh}
+
+Although inactive block outputs are relatively stable between consecutive steps, repeatedly reusing them can propagate stale features through subsequent blocks and accumulate approximation error over time. We mitigate this effect with \emph{periodic cache refresh}. At a refresh step, all token positions are recomputed in every Transformer block, and all cached block outputs are replaced with the freshly computed outputs.
+
+The refresh interval $N$ controls the trade-off between generation quality and inference efficiency. A smaller $N$ introduces more frequent full-token recomputation, reducing accumulated cache error at the cost of additional computation. A larger $N$ produces more cached steps and greater computational savings, but allows stale block outputs to persist longer. When $N=1$, every eligible step is a refresh step and the method is equivalent to baseline Halton-MaskGIT with full-token recomputation. In the limit $N\to\infty$, no periodic refresh is performed, yielding the maximum degree of block-output reuse.
+
+Step gating and periodic cache refresh address complementary failure modes. Step gating prevents reuse before block outputs become sufficiently stable, whereas periodic cache refresh resets errors that accumulate after reuse has begun. Together with the active set $A_t=U_{t-1}\cup U_t$, these mechanisms enable the layer-output cache to reduce both attention and FFN computation while preserving generation quality.

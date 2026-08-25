@@ -51,6 +51,60 @@ def _env_float(name, default):
         return default
 
 
+# ---------------------------------------------------------------------------
+# LazyMAR V-similarity selection (HALTON_LAZY_VSIM=1)
+# ---------------------------------------------------------------------------
+# 逐位抄自 LazyMAR/models/basic.py 的 RETAIN_RATIO_SCHEDULE (ICCV'25)。
+# 语义 = 该 decoding step 要"重算 (retain)"的 token 占比, 随 step 单调衰减:
+# 生成早期整幅图还在剧烈变化 -> 全部重算; 后期只剩局部细节 -> 5% 就够。
+# LazyMAR 的 MAR 走 64 个 AR step, Halton 这里默认 32 步, 故按"生成进度"
+# 重采样 (见 _lazymar_ratio)。
+LAZYMAR_RETAIN_RATIO_SCHEDULE = [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    0.6, 0.5, 0.5, 0.5, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4,
+    0.15, 0.15, 0.15, 0.15, 0.15, 0.12, 0.12, 0.12, 0.12, 0.12,
+    0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05,
+    0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05,
+    0.05, 0.05, 0.05, 0.05,
+]
+
+
+def _lazymar_ratio(step, total_steps):
+    """LazyMAR 的 64 步衰减表按生成进度重采样到 total_steps 步。
+
+    idx = floor(step * 64 / total_steps) —— total_steps=32 时就是 idx = 2*step,
+    即两张表在"已生成比例"这条轴上对齐。
+    """
+    n = len(LAZYMAR_RETAIN_RATIO_SCHEDULE)
+    if step is None:
+        return 1.0
+    t = int(total_steps) if total_steps else n
+    idx = int(int(step) * n / max(1, t))
+    return LAZYMAR_RETAIN_RATIO_SCHEDULE[min(max(idx, 0), n - 1)]
+
+
+def _lazy_vsim_ratio(step, total_steps):
+    """本 step 的重算比例 rho_t。HALTON_LAZY_VSIM_SCHED 可覆盖:
+
+        "lazymar" (默认)   LazyMAR 的衰减表, 按进度重采样
+        "0.3"              常数比例
+        "1,1,0.5,0.2,..."  逐 step 给定 (超出长度时沿用最后一个值)
+    """
+    sched = os.environ.get("HALTON_LAZY_VSIM_SCHED", "lazymar").strip()
+    if sched in ("", "lazymar"):
+        return _lazymar_ratio(step, total_steps)
+    try:
+        vals = [float(v) for v in sched.split(",") if v.strip() != ""]
+    except ValueError:
+        return _lazymar_ratio(step, total_steps)
+    if not vals:
+        return _lazymar_ratio(step, total_steps)
+    if step is None:
+        return vals[0]
+    return vals[min(int(step), len(vals) - 1)]
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim, h_dim, multiple_of=256, bias=False, dropout=0.):
         super().__init__()
@@ -565,7 +619,7 @@ class TransformerEncoder(nn.Module):
                 "active_sum": 0, "token_sum": 0,
                 "partial_active_sum": 0, "partial_token_sum": 0,
                 "score_miss": 0, "restore_miss": 0, "forced_nonuniform": 0,
-                "scored_calls": 0, "forced_only_calls": 0,
+                "scored_calls": 0, "forced_only_calls": 0, "vsim_calls": 0,
                 "head_partial_calls": 0, "head_full_calls": 0, "head_miss": 0}
 
     def clear_ffn_cache(self):
@@ -589,7 +643,7 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x, cond, mask=None, active_mask=None,
                 partial_update_start_layer=3, partial_update_end_layer=21,
-                cfg_pair=False):
+                cfg_pair=False, step=None, total_steps=None):
         self.lazy_last_active_idx = None    # 只对本次 forward 有效, 先清掉
 
         # Layer-level gating (from analyze_ffn_delta_stability):
@@ -610,6 +664,12 @@ class TransformerEncoder(nn.Module):
             except ValueError:
                 pass
 
+        if _env_flag("HALTON_LAZY_VSIM") and not _env_flag("HALTON_LAZY_CACHE"):
+            raise RuntimeError(
+                "HALTON_LAZY_VSIM 是 LazyMAR Token Cache 的一个选点模式, "
+                "必须同时设置 HALTON_LAZY_CACHE=1。"
+            )
+
         # ── LazyMAR Token Cache (HALTON_LAZY_CACHE=1) ─────────────────────
         # 与既有的 ffn/attn/layer cache 三个方案互斥, 便于做公平对比。
         if _env_flag("HALTON_LAZY_CACHE"):
@@ -626,8 +686,15 @@ class TransformerEncoder(nn.Module):
                                _env_int("HALTON_PARTIAL_START_LAYER", 0))
             l_end = _env_int("HALTON_LAZY_END_LAYER",
                              _env_int("HALTON_PARTIAL_END_LAYER", len(self.layers) - 1))
+            if _env_flag("HALTON_LAZY_VSIM") and l_start < 1:
+                raise RuntimeError(
+                    "HALTON_LAZY_VSIM 需要 HALTON_LAZY_START_LAYER >= 1: 打分要用入口层"
+                    "相对上一步的 V 变化量, 而 layer 0 的输入只在 U_{t-1} 处变过, "
+                    "在那里打分等于退化回调度选点。LazyMAR 用的是 decoder layer 3。"
+                )
             return self._forward_lazy(
                 x, cond, mask, active_mask, l_start, l_end, cfg_pair,
+                step=step, total_steps=total_steps,
             )
 
         for i, block in enumerate(self.layers):
@@ -722,6 +789,42 @@ class TransformerEncoder(nn.Module):
         idx, _ = torch.sort(idx, dim=1)      # 升序: 与 boolean-index 的顺序一致
         return idx
 
+    def _lazy_select_vsim(self, xv, prev_v, budget, cfg_pair):
+        """纯 V-相似度选点 (HALTON_LAZY_VSIM=1) —— LazyMAR _prune_tokens 的复刻。
+
+        与 _lazy_select 的区别只有一个, 但是本质的: **不存在强制集合**。
+        LazyMAR 会把 mask_to_pred / prev_mask_to_pred 的分数按住不放 (score=0,
+        升序排在最前) 从而无条件保留; 这里按要求把这条去掉, 名额全部由"入口层 V
+        相对上一 decoding step 的余弦变化量"决定 —— 变化越大越该重算。
+        于是本步要 commit 的 U_t 也可能落选而用上一步的 logit, 这正是本接口要
+        测的东西。
+
+        budget = ceil(rho_t * N), rho_t 由 _lazy_vsim_ratio 给出 (随 step 衰减)。
+        固定名额而非阈值: 保证每行 active 数一致, (b, k) 才拼得出来。
+        返回升序下标 (b, budget)。
+        """
+        b, _, n, _ = xv.shape
+        if (prev_v is None or prev_v.shape != xv.shape
+                or prev_v.device != xv.device or prev_v.dtype != xv.dtype):
+            # 没有可比的上一步 V: 退化成全量重算, 安全但不省算力。
+            self.lazy_stats["score_miss"] += 1
+            return torch.arange(n, device=xv.device).unsqueeze(0).expand(b, n)
+
+        # fp32 打分: bf16 下近乎相同的两个高维向量做余弦会丢掉判别位。
+        cos = F.cosine_similarity(xv.float(), prev_v.float(), dim=-1).mean(dim=1)
+        score = 1.0 - cos                                   # (b, N) 变化量
+
+        if cfg_pair and b % 2 == 0:
+            # [cond ; uncond] 两半必须选同一批 token, 否则 CFG 相减时会引入两套
+            # 不同的近似误差。
+            half = b // 2
+            shared = 0.5 * (score[:half] + score[half:])
+            score = torch.cat([shared, shared], dim=0)
+
+        idx = score.topk(budget, dim=1).indices
+        idx, _ = torch.sort(idx, dim=1)      # 升序: 与 boolean-index 的顺序一致
+        return idx
+
     def _lazy_restore(self, x_act, active_idx, b, n, c):
         """把 active 行写回全长残差流, inactive 行取缓存中上一步的值。
 
@@ -742,7 +845,8 @@ class TransformerEncoder(nn.Module):
         self.lazy_restore_cache = out.detach()
         return out
 
-    def _forward_lazy(self, x, cond, mask, forced_mask, start, end, cfg_pair):
+    def _forward_lazy(self, x, cond, mask, forced_mask, start, end, cfg_pair,
+                      step=None, total_steps=None):
         """LazyMAR Token Cache 的完整前向。
 
         forced_mask is None → 全量步: k = N, 所有缓存被整体刷新, 且逐位等于
@@ -768,10 +872,38 @@ class TransformerEncoder(nn.Module):
             x = self.layers[i](x, cond, mask=mask, active_mask=None)
 
         b, n, c = x.shape
-        budget = self._lazy_budget(n, forced_mask)
+
+        # ── V-打分模式 (HALTON_LAZY_VSIM=1): 无强制集合, 名额随 step 衰减 ──
+        # forced_mask 在这个模式里只剩一个用途: 标记"这是不是一个 partial 步"
+        # (采样器的 step gate 5..30 + REFRESH_N 决定), 与 lazy cache 完全一致。
+        vsim = _env_flag("HALTON_LAZY_VSIM") and forced_mask is not None
+        if vsim:
+            rho = min(max(_lazy_vsim_ratio(step, total_steps), 0.0), 1.0)
+            budget = max(1, min(n, int(math.ceil(rho * n))))
+        else:
+            budget = self._lazy_budget(n, forced_mask)
         n_forced = n if forced_mask is None else int(forced_mask.sum(dim=1).max().item())
 
-        if budget > n_forced:
+        if vsim and budget < n:
+            # 入口层要全长 K/V 才能算 V 的余弦变化量 (LazyMAR 在 decoder layer 3
+            # 做这件事; 这里 start 同样应 >= 1, 让下面几层每步全量给它攒材料)。
+            prev_v = self.layers[start].attn.cached_v      # 上一步入口层的 V
+            self.lazy_stats["vsim_calls"] += 1
+            self.lazy_stats["scored_calls"] += 1
+            x_act, active_idx = self.layers[start].forward_lazy(
+                x, cond, active_idx=None, seq_len=n, mask=mask,
+                select_fn=lambda xv: self._lazy_select_vsim(xv, prev_v, budget, cfg_pair),
+            )
+            first = start + 1
+        elif vsim:
+            # rho_t = 1 (LazyMAR 表的前 20/64 步): 本步全部重算 —— 不必先算全长
+            # K/V 去打分, 直接走便宜的那条路, 顺带把所有层的 K/V 缓存刷新。
+            self.lazy_stats["vsim_calls"] += 1
+            self.lazy_stats["forced_only_calls"] += 1
+            active_idx = torch.arange(n, device=x.device).unsqueeze(0).expand(b, n)
+            x_act = x
+            first = start
+        elif budget > n_forced:
             # ── 打分模式 (r < 1): 入口层要全长 K/V 才能算 V 的余弦变化量 ──
             prev_v = self.layers[start].attn.cached_v      # 上一步入口层的 V
             self.lazy_stats["scored_calls"] += 1
@@ -893,7 +1025,8 @@ class Transformer(nn.Module):
         if self.register > 0:
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
-    def forward(self, x, y, drop_label, mask=None, active_mask=None, cfg_pair=False):
+    def forward(self, x, y, drop_label, mask=None, active_mask=None, cfg_pair=False,
+                step=None, total_steps=None):
         """
         active_mask: (b, h, w) bool — newly-active token positions for
         partial-update mode (Q-only-active attention).
@@ -901,6 +1034,10 @@ class Transformer(nn.Module):
         cfg_pair:    True when the batch is laid out as [cond ; uncond] (the
         sampler's CFG call).  Only used by the LazyMAR Token Cache, so that both
         halves select the same token set.
+        step / total_steps: current decoding step index and the total number of
+        steps.  Only used by the V-similarity selection (HALTON_LAZY_VSIM=1),
+        whose recompute ratio decays with the step (LazyMAR's
+        RETAIN_RATIO_SCHEDULE).  Everything else ignores them.
         """
         b, h, w = x.size()
         h0, w0 = h, w   # original spatial dims before any proj
@@ -946,7 +1083,8 @@ class Transformer(nn.Module):
             reg = torch.arange(0, self.register, dtype=torch.long, device=x.device)
             x = torch.cat([x, self.reg_tokens(reg).expand(b, self.register, self.hidden_dim)], dim=1)
 
-        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask, cfg_pair=cfg_pair)
+        x = self.transformer(x, y, mask=mask, active_mask=seq_active_mask, cfg_pair=cfg_pair,
+                             step=step, total_steps=total_steps)
 
         x = x[:, :h * w].contiguous()   # drop register tokens
 
@@ -974,10 +1112,19 @@ class Transformer(nn.Module):
 
         if act_idx is not None:
             n_img = x.size(1)
-            # active_idx 升序 → 图像 token 的下标全部排在 register 之前
-            k_img = int((act_idx[0] < n_img).sum().item())
-            if k_img > 0:
+            if _env_flag("HALTON_LAZY_VSIM"):
+                # V-打分模式下 active 集合是内容自适应的: 第 i 行可能选中 register
+                # token 而第 j 行没有, "图像 token 数"因此逐行不同, 不能拿行 0 的
+                # 前缀长度去 gather。把下标 clamp 进图像范围即可 —— 被 clamp 的条目
+                # 只是对某个 inactive 图像 token 多算一次 head, 而它此刻的 hidden
+                # state 正是缓存里那份 logit 的来源, 写回去是恒等操作。
+                idx = act_idx.clamp(max=n_img - 1)
+                k_img = int(idx.size(1))
+            else:
+                # active_idx 升序 → 图像 token 的下标全部排在 register 之前
+                k_img = int((act_idx[0] < n_img).sum().item())
                 idx = act_idx[:, :k_img]
+            if k_img > 0:
                 x_act = torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.size(-1)))
                 logit_act = self.head(self.last_norm(x_act, y))
                 cache = self.lazy_logit_cache

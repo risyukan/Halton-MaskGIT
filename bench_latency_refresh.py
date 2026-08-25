@@ -1,11 +1,13 @@
-"""端到端 latency: lazy r=1 / 24 层 / lazy head 在 refresh N ∈ {0,2,4,8,13} 下的实测。
+"""端到端 latency: lazy r=1 / 全部层 / lazy head 在 refresh N ∈ {0,2,3,4,8,13} 下的实测。
 
 与 bench_latency.py 同一套方法 (同进程只加载一次模型, cuda.synchronize 包夹,
 warmup 后多次取均值, VQGAN 解码单独计时并从 total 里扣掉), 只是把配置换成
 refresh 周期扫描。理论列直接从 flops_lazy_refresh.py 取, 保证两边同一个 FLOPs 模型。
 
-用法:  python bench_latency_refresh.py [batch] [warmup] [timed]
-默认    python bench_latency_refresh.py 16 1 5
+用法:  python bench_latency_refresh.py [batch] [warmup] [timed] [size]
+默认    python bench_latency_refresh.py 16 1 5 large
+size ∈ {small, base, large} —— 对应 saved_networks/ImageNet_384_{size}.pth,
+理论列会同步切到同一尺寸 (flops_lazy_refresh.set_size)。
 """
 import os
 import sys
@@ -21,10 +23,13 @@ import flops_lazy_refresh as FL
 BATCH  = int(sys.argv[1]) if len(sys.argv) > 1 else 16
 WARMUP = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 TIMED  = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+SIZE   = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("LAZY_VIT_SIZE", "large")
+
+FL.set_size(SIZE)                    # 理论列与被测模型同尺寸
 
 args = load_args_from_file("Config/base_cls2img.yaml")
 args.device = torch.device("cuda")
-args.vit_size = "large"
+args.vit_size = SIZE
 args.img_size = 384
 args.compile = False
 args.dtype = "float32"
@@ -83,9 +88,9 @@ def bench(fn):
 
 
 CONFIGS = [("baseline", None)] + [(f"lazy r=1 N={n if n else 'none'}", n)
-                                  for n in [0, 2, 4, 8, 13]]
+                                  for n in FL.REFRESH_NS]
 
-print(f"\n== latency bench (refresh sweep) | large-384 | batch={BATCH} | "
+print(f"\n== latency bench (refresh sweep) | {SIZE}-384 | batch={BATCH} | "
       f"warmup={WARMUP} timed={TIMED} | {torch.cuda.get_device_name(0)} ==\n")
 
 dec_mean, dec_std = bench(time_decode)

@@ -1,0 +1,218 @@
+# Halton-MaskGIT — large 384 / cfg=0.5   LazyMAR 选点复刻 (HALTON_LAZY_VSIM) sweep
+#
+# Model    : ImageNet_384_large.pth (H-MaskGIT-L, 480M, 24 层 / 1024 dim / 24^2+1=577 token)
+# Sampler  : halton, step=32, cfg_w=0.5, fp32, seed=42, global_bsize=32, 50000 imgs
+#            —— Halton 顺序 / step gate / 温度 / CFG 与 baseline 完全一致, 未改动。
+# Gate     : step 5..30 (与 lazycache sweep 完全相同), REFRESH_N=2
+# Layers   : LAZY_START=3 .. LAZY_END=23 (从第 3 层一路用到最后一层)
+#
+# ============================================================================
+# 方案: 只换"选哪些 token 重算", 执行机制与 HALTON_LAZY_CACHE 共用
+# ----------------------------------------------------------------------------
+# 执行 (不变, 见 results/halton_large384_lazycache_sweep.txt):
+#   Q 只算 active token; K/V 走 per-layer 全长缓存 (active 行重算后 scatter 回缓存)
+#   —— 双向 self-attention 的上下文保持完整; FFN 只算 active; 区间出口层用缓存回填
+#   inactive 行; head 也只算 active 行。
+#
+# 选点 (本方案的全部改动) —— LazyMAR/models/basic.py 的 _prune_tokens 复刻:
+#   score_i = 1 - cos( V_l(t)_i , V_l(t-1)_i )     l = LAZY_START = 3
+#             V 取入口层 (layer 3) 的 value, 按 head 求均值后按 token 打分;
+#             fp32 计算 (bf16 下近乎相同的 1024 维向量做余弦会丢判别位)。
+#   active  = TopK_{k_t}(score),  k_t = ceil(rho_t * N)
+#   rho_t   = LazyMAR 的 RETAIN_RATIO_SCHEDULE, 随 step 单调衰减,
+#             64 步表按生成进度重采样到 32 步 (idx = floor(2*t)):
+#               t = 0..9   -> 1.00      t = 10 -> 0.60     t = 11,12 -> 0.50
+#               t = 13,14  -> 0.40      t = 15..17 -> 0.15 t = 18,19 -> 0.12
+#               t = 20..31 -> 0.05
+#   **没有任何强制 token**: LazyMAR 里 score[mask_to_pred]=0 / +15 名额那一段被
+#   整个去掉 —— U_t (本步要 commit 的 token)、U_{t-1}、register 全都只按 V 的变化
+#   量竞争名额, 落选就沿用上一步的 logit。这正是本接口要测的东西。
+#   CFG 两半 ([cond ; uncond]) 共享同一份分数, 保证选中同一批 token。
+#
+# 与 lazycache (r=1) 的对照 —— 唯一差别就是上面这一段:
+#   lazycache : active = U_t ∪ U_{t-1} ∪ register, 纯调度决定, k/N ≈ 0.0587 恒定
+#   lazyvsim  : active = TopK(V 余弦变化量), 内容自适应, k/N = rho_t 随 step 衰减
+#               REFRESH_N=2 下 13 个 partial 步的 k/N:
+#                 t=6,8 -> 1.00 (退化成全量, 不打分)  t=10 -> 0.60  t=12 -> 0.50
+#                 t=14 -> 0.40  t=16 -> 0.15  t=18 -> 0.12  t=20..30(偶) -> 0.05
+#               partial 步平均 k/N = 4.07/13 = 0.3131
+#
+# 起效 step 与 lazy cache 完全一致 (Sampler/halton_sampler.py 的 gate 未改):
+#   step 5..30 中, gated_step_counter % REFRESH_N == 0 的步做全量刷新,
+#   REFRESH_N=2 -> 刷新落在 step 5,7,...,29 (共 13 步 + gate 外 6 步 = 19 全量步),
+#   partial 落在 step 6,8,...,30 (13 步)。
+#
+# 接口: launch/eval_fid_large384_lazyvsim.sh
+#   HALTON_LAZY_CACHE=1 HALTON_LAZY_VSIM=1
+#   HALTON_LAZY_VSIM_SCHED=lazymar|<常数>|<逐步逗号表>
+#   HALTON_LAZY_START_LAYER=3 HALTON_LAZY_END_LAYER=23 HALTON_CACHE_REFRESH_N=2
+#   保护: 未开 HALTON_LAZY_CACHE 或 START_LAYER=0 时直接报错 (layer 0 的输入只在
+#   U_{t-1} 处变过, 在那里打分等于退化回调度选点)。
+#   测试: python test_lazy_vsim.py (9/9) —— 含"预算 = ceil(rho_t*N)"、"选点确为
+#   V 余弦 TopK"、"U_t 确实会落选 (无强制集合)"、"step gate 与 lazycache 逐步一致"。
+#   既有方案未受影响: python test_lazy_token_cache.py (16/16),
+#                    python test_cache_regression.py (6/6 逐位不变)。
+#
+# 对照 (同 sampler / 同 seed / 同 gate, 取自 lazycache sweep):
+#   baseline (无 cache)              FID 2.5410  IS 256.15
+#   lazycache r=1 N=2  (L0-23)       FID 2.6951  IS 252.31   实测 1.552x
+#   lazycache r=1 N=4  (L0-23)       FID 3.1899  IS 238.04   实测 2.108x
+#
+# columns: config_name  FID  IS  runtime  notes
+# ----------------------------------------------------------------------------
+#
+# 【实测端到端 latency】batch=16, warmup=1 timed=5, 单卡 A6000, fp32, no compile,
+#   ImageNet_384_large.pth, cfg_w=0.5, step=32, REFRESH_N=2
+#   复现: python bench_latency_vsim.py 16 1 5
+#   VQGAN decode = 24.89 ms/img (各档相同, 已从 transf 中扣除)
+#
+#   config                total ms/img  transf ms/img   ±ms    实测加速
+#   baseline                 2037.23       2012.34     23.86   1.000x
+#   lazycache r=1 N=2        1321.54       1296.65      0.72   1.552x
+#   lazyvsim  N=2 L3-23      1586.96       1562.07      0.27   1.288x
+#
+#   (lazycache 的 1.552x 与 lazycache sweep 里记录的 1.552x 完全一致 —— 两次
+#    bench 相互印证, 三档是同一进程同一批 warmup 下测的。)
+#
+#   运行时计数与理论逐项吻合 (kv_miss=0, score_miss=0, head miss=0):
+#     lazycache : partial k/N=0.0587  13 partial / 19 full  vsim=0  scored=0
+#     lazyvsim  : partial k/N=0.3136  13 partial / 19 full  vsim=13 scored=11
+#                 (scored=11 而非 13: t=6,8 的 rho_t=1 → 全部重算, 按设计跳过打分)
+#
+#   为什么只有 1.288x 而 lazycache 有 1.552x —— 三个原因叠加, 都来自 LazyMAR 的
+#   衰减表本身, 不是实现开销:
+#     (1) partial 步平均重算 31.4% 的 token, 而 lazycache 只重算 5.9%;
+#     (2) rho_t 表的前 20/64 项是 1.0, 映射到 32 步后 t=6,8 两个 partial 步退化成
+#         全量 —— 13 个 partial 步里有 2 个完全不省;
+#     (3) 打分要在入口层为 *全部* token 算一遍 K/V (LazyMAR 在 decoder layer 3 做
+#         同样的事), 且 LAZY_START=3 意味着第 0..2 层每步全量, 而 lazycache 的
+#         LAZY_START=0 让 24 层全部进入 lazy 区间。
+#
+# 【50k FID】(4x A6000 DDP, global_bsize=32, 50000 imgs, seed=42, cfg=0.5)
+#   对照: baseline FID 2.5410 / IS 256.15 ; lazycache r=1 N=2 FID 2.6951 / IS 252.31
+#   下面这一行由 launch/eval_fid_large384_lazyvsim.sh 自动 append。
+#
+# columns: config_name  FID  IS  runtime  notes
+# ----------------------------------------------------------------------------
+lazyvsim_lazymar_N2_L3-23_cfg0.5               2.6422   254.3667  3:11:20   sched=lazymar refresh_every_2 layers=3..23 cfg=0.5 no-forced-token
+
+# ============================================================================
+# 【结果】50k FID 2.6422 / IS 254.37 / eval 3:11:20  (实测 1.288x)
+#
+#   method                  FID       IS        实测加速   eval runtime
+#   baseline (无 cache)     2.5410   256.15     1.000x        —
+#   lazyvsim  N=2 L3-23     2.6422   254.37     1.288x     3:11:20
+#   lazycache r=1 N=2       2.6951   252.31     1.552x     2:41:29
+#
+#   FID 比 lazycache N=2 好 0.053 (把 baseline→lazycache 的差距补回 34%),
+#   但加速少了 0.264x (放弃了 48% 的加速增量)。两者不互相支配 —— vsim 提供的是
+#   lazycache 拿不到的一个中间档: lazycache 的 N 是整数且 N=1 就等于 baseline,
+#   在 1.0x 和 1.552x 之间本来没有任何操作点。
+#
+# ============================================================================
+# 【结论】去掉强制集合几乎没有代价 —— 因为它一半是冗余的, 另一半不重要
+#
+# 实测每个 partial 步 active 集合对强制集合的覆盖率 (真实 checkpoint, batch 4 +
+# CFG, 非 randomize, 一次 generation; 探针见下方复现说明):
+#
+#   step     k     k/N  forced  forced覆盖   U_t  U_t覆盖  U_(t-1)  U_(t-1)覆盖  reg覆盖
+#      6   577  1.0000      24     100.0%    11   100.0%       12      100.0%   100.0%
+#      8   577  1.0000      25     100.0%    12   100.0%       12      100.0%   100.0%
+#     10   347  0.6014      25      76.0%    12    50.0%       12      100.0%   100.0%
+#     12   289  0.5009      26      60.6%    13    21.2%       12      100.0%   100.0%
+#     14   231  0.4003      26      65.4%    12    27.1%       13      100.0%    75.0%
+#     16    87  0.1508      28      46.4%    14     0.0%       13      100.0%     0.0%
+#     18    70  0.1213      29      48.3%    14     0.0%       14      100.0%     0.0%
+#     20    29  0.0503      30      46.7%    15     0.0%       14      100.0%     0.0%
+#     22    29  0.0503      33      45.5%    17     0.0%       15      100.0%     0.0%
+#     24    29  0.0503      35      47.1%    18     2.8%       16      100.0%     0.0%
+#     26    29  0.0503      41      46.3%    21     0.0%       19      100.0%     0.0%
+#     28    29  0.0503      48      45.8%    25     0.0%       22      100.0%     0.0%
+#     30    29  0.0503      70      41.4%    39     0.0%       30       96.7%     0.0%
+#
+#   (1) U_(t-1) 覆盖率恒为 100% —— 不需要强制。这些 token 的 code 在上一步刚被
+#       改写, 它们在 layer 3 的 V 因此变化最大, 打分自然把它们排在最前。LazyMAR
+#       的 score[prev_mask_to_pred]=0 对这一半是纯冗余的。
+#   (2) U_t 覆盖率从 step 16 起恒为 0% —— 真的被丢掉了。也就是说 step 16..30 的
+#       每个 partial 步, 本步要 commit 的 token 用的都是上一步的陈旧 logit。
+#       原因也清楚: U_t 的 code 此刻还是 mask, 打分时它的 V 与上一步一模一样,
+#       永远排在最后。这是本次消融真正在测的东西 —— 而 FID 不但没崩, 还比每步都
+#       把 U_t 算新鲜的 lazycache 更好。
+#       解释: 到了这些 step, 一个仍被 mask 的 token 的 logit 在相邻两步之间几乎
+#       不变 (每步只有 ~2% 的邻居被填上), 陈旧一步的代价远小于"中层多重算 25%
+#       的 token"带来的收益 (31.4% vs 5.9%)。
+#   (3) register 覆盖率从 step 16 起也是 0% —— attention sink 同样被冻住, 未见
+#       可辨识的损失。
+#
+#   -> 对 Halton-MaskGIT 而言, LazyMAR 的强制集合不是这个方法起作用的原因;
+#      起作用的是"用 V 的变化量把算力集中到真正在变的 token 上"+ 中层的总预算。
+#
+#   复现探针: 在 _forward_lazy 上挂 spy 记录 lazy_last_active_idx, 与
+#   HaltonSampler.compute_schedule 给出的 l_U_t 求交 (batch 4, cfg=0.5, step=32,
+#   REFRESH_N=2, L3-23)。
+#
+# 【下一步可试的杠杆】
+#   - VSIM_SCHED 改成不含 1.0 的表 (如 "0.6,...,0.05"): step 6/8 那两个退化成
+#     全量的 partial 步是纯浪费, 去掉后加速应能往 1.4x 走而 FID 变化不大。
+#   - LAZY_START=1 (而非 3): 让 layer 1..23 都进 lazy 区间, 省掉 layer 1/2 的
+#     每步全量; 打分材料仍然充足。
+#   - 与 lazycache 的混合: 只把 U_t 加回强制集合 (U_(t-1) 已被打分自动覆盖),
+#     成本仅 ~15/577 个名额, 可验证 (2) 的解释是否稳健。
+
+# ============================================================================
+# 【N 扫描】lazyvsim L3-23 / cfg=0.5 在 REFRESH_N ∈ {none,2,3,4,8,13} 下的全套测量
+#   (2026-08-25 补做; N=2 一行已在上面, 不重跑)
+# ----------------------------------------------------------------------------
+#
+# 【理论 FLOPs】baseline = 13059.8 GFLOPs/image  (depth=24 d=1024 swiglu_h=2816 seq=577)
+#   复现: python flops_lazy_vsim.py large
+#   partial 步成本 = 层0..2 全量 + 入口层(全长 K/V + k 行 Q/FFN) + 层4..23(k 行)
+#                    + lazy head(k 行);  rho_t=1 的 partial 步退化成全量, 完全不省。
+#
+#   N     refresh步  partial步  其中rho=1  全量步合计  平均k/N   GFLOPs   FLOPs比   理论加速
+#   none      0         26          5          6      0.3328   6869.7   0.5260    1.901x
+#   2        13         13          2         19      0.3136   9875.7   0.7562    1.322x
+#   3         9         17          3         15      0.3176   8920.3   0.6830    1.464x
+#   4         7         19          3         13      0.3131   8403.3   0.6434    1.554x
+#   8         4         22          4         10      0.3250   7761.4   0.5943    1.683x
+#   13        2         24          4          8      0.3138   7183.2   0.5500    1.818x
+#
+# 【实测端到端 latency】batch=16, warmup=1 timed=5, 单卡 A6000, fp32, no compile,
+#   ImageNet_384_large.pth, cfg_w=0.5, step=32   (2026-08-25)
+#   复现: python bench_latency_vsim_sweep.py 16 1 5 large -> results/latency/bench_vsim_large.txt
+#   VQGAN decode = 24.90 ms/img (各档相同, 已从 transf 中扣除)
+#
+#   config              total ms/img  transf ms/img   实测加速  理论加速  达成率
+#   baseline               2033.17       2008.28     1.000x   1.000x   100.0%
+#   lazyvsim N=none        1146.63       1121.73     1.790x   1.901x    94.2%
+#   lazyvsim N=2           1583.69       1558.79     1.288x   1.322x    97.4%
+#   lazyvsim N=3           1445.95       1421.06     1.413x   1.464x    96.5%
+#   lazyvsim N=4           1370.80       1345.90     1.492x   1.554x    96.0%
+#   lazyvsim N=8           1277.29       1252.40     1.604x   1.683x    95.3%
+#   lazyvsim N=13          1193.08       1168.19     1.719x   1.818x    94.6%
+#   —— 同进程测的 lazycache r=1 参照档 (L0-23) ——
+#   lazycache N=none        581.56        556.66     3.608x   4.268x    84.5%
+#   lazycache N=2          1320.06       1295.17     1.551x   1.618x    95.8%
+#   lazycache N=3          1092.61       1067.71     1.881x   2.002x    94.0%
+#   lazycache N=4           978.87        953.98     2.105x   2.271x    92.7%
+#   lazycache N=8           807.24        782.34     2.567x   2.844x    90.3%
+#   lazycache N=13          696.16        671.27     2.992x   3.404x    87.9%
+#
+#   两处交叉验证 (与本文件上半部分 / lazycache sweep 的独立 bench 完全一致):
+#     lazyvsim N=2   1.288x  vs  上面记录的 1.288x
+#     lazycache N=2  1.551x  vs  lazycache sweep 记录的 1.552x
+#
+#   运行时计数与理论逐项吻合 (kv_miss=0, score_miss=0, head miss=0):
+#     N=none partial 26 / full 6, vsim=26 scored=21   N=2  partial 13 / full 19, scored=11
+#     N=3    partial 17 / full 15, scored=14          N=4  partial 19 / full 13, scored=16
+#     N=8    partial 22 / full 10, scored=18          N=13 partial 24 / full  8, scored=20
+#     (scored < partial 的差额 = rho_t=1 的退化步, 按设计跳过打分)
+#
+# 【50k FID】(4x A6000 DDP, global_bsize=32, 50000 imgs, seed=42, cfg=0.5)
+#   对照: baseline FID 2.5410 / IS 256.15
+#   lazycache r=1 参照 (results/halton_large384_lazycache_sweep.txt):
+#     N=2 2.6951/252.31   N=4 3.1899/238.04
+#   下面的行由 launch/eval_fid_large384_lazyvsim.sh 自动 append (N=none,3,4,8,13)。
+#
+# columns: config_name  FID  IS  runtime  notes
+# ----------------------------------------------------------------------------

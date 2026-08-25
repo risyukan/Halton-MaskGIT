@@ -1,0 +1,40 @@
+Init Cls-to-Img Maskgit on [GPU0]
+Load ckpt from: ./saved_networks/ImageNet_384_base.pth
+Number of iteration(s): 1500001
+Size of model vit: 142.470M
+Size of model vqgan-llama: 71.883M
+Parameters:  Namespace(bsize=256, cfg_w=3.0, codebook_size=16384, compile=False, data='imagenet_feat', data_folder='', debug=True, device=device(type='cuda'), drop_label=0.1, dropout=0.1, dtype='float32', epoch=10000, eval_folder='', f_factor=16, global_epoch=299, global_rank=0, grad_clip=1.0, grad_cum=1, img_size=384, is_master=True, is_multi_gpus=False, iter=1500001, lr=0.0001, mask_value=16384, mode='cls-to-img', nb_class=1000, num_workers=8, proj=1, r_temp=4.5, randomize=False, register=1, resume=True, sampler='halton', sched_mode='arccos', sched_pow=2.0, seed=-1, sm_temp=1.0, sm_temp_min=1.0, step=32, temp_warmup=0, test_only=False, top_k=-1, use_ema=False, vit_folder='./saved_networks/ImageNet_384_base.pth', vit_size='base', vqgan_folder='./saved_networks/vq_ds16_c2i.pt', warm_up=2500, writer_log='')
+
+== latency bench (lazyvsim refresh sweep) | base-384 | batch=16 | warmup=1 timed=5 | cfg_w=0.7 | lazy L3-11 | NVIDIA RTX A6000 ==
+
+VQGAN decode      :   25.15 ms/img  (batch   402.4±0.4 ms)
+
+config                      total ms/img  transf ms/img     ±ms       实测      理论     达成率
+baseline                        711.61         686.46     6.34   1.000x   1.000x  100.0%
+lazyvsim N=none L3-11           475.64         450.50     0.16   1.524x   1.713x   89.0%
+                           └ partial k/N=0.3328 (26 步) / 全量 6 步; vsim=26 scored=21 kv_miss=0 score_miss=0 head(p/f/miss)=26/6/0
+lazyvsim N=2 L3-11              593.43         568.29     0.26   1.208x   1.272x   94.9%
+                           └ partial k/N=0.3136 (13 步) / 全量 19 步; vsim=13 scored=11 kv_miss=0 score_miss=0 head(p/f/miss)=13/19/0
+lazyvsim N=3 L3-11              555.39         530.25     0.25   1.295x   1.386x   93.4%
+                           └ partial k/N=0.3176 (17 步) / 全量 15 步; vsim=17 scored=14 kv_miss=0 score_miss=0 head(p/f/miss)=17/15/0
+lazyvsim N=4 L3-11              534.56         509.41     0.12   1.348x   1.456x   92.6%
+                           └ partial k/N=0.3131 (19 步) / 全量 13 步; vsim=19 scored=16 kv_miss=0 score_miss=0 head(p/f/miss)=19/13/0
+lazyvsim N=8 L3-11              509.41         484.26     0.11   1.418x   1.553x   91.3%
+                           └ partial k/N=0.3250 (22 步) / 全量 10 步; vsim=22 scored=18 kv_miss=0 score_miss=0 head(p/f/miss)=22/10/0
+lazyvsim N=13 L3-11             486.38         461.23     0.13   1.488x   1.653x   90.0%
+                           └ partial k/N=0.3138 (24 步) / 全量 8 步; vsim=24 scored=20 kv_miss=0 score_miss=0 head(p/f/miss)=24/8/0
+lazycache r=1 N=none            255.32         230.17     0.13   2.982x   4.269x   69.9%
+                           └ partial k/N=0.0569 (26 步) / 全量 6 步; vsim=0 scored=0 kv_miss=0 score_miss=0 head(p/f/miss)=26/6/0
+lazycache r=1 N=2               486.85         461.70     0.13   1.487x   1.619x   91.9%
+                           └ partial k/N=0.0587 (13 步) / 全量 19 步; vsim=0 scored=0 kv_miss=0 score_miss=0 head(p/f/miss)=13/19/0
+lazycache r=1 N=3               415.68         390.54     0.12   1.758x   2.002x   87.8%
+                           └ partial k/N=0.0573 (17 步) / 全量 15 步; vsim=0 scored=0 kv_miss=0 score_miss=0 head(p/f/miss)=17/15/0
+lazycache r=1 N=4               380.09         354.94     0.22   1.934x   2.271x   85.2%
+                           └ partial k/N=0.0567 (19 步) / 全量 13 步; vsim=0 scored=0 kv_miss=0 score_miss=0 head(p/f/miss)=19/13/0
+lazycache r=1 N=8               326.37         301.22     0.09   2.279x   2.844x   80.1%
+                           └ partial k/N=0.0562 (22 步) / 全量 10 步; vsim=0 scored=0 kv_miss=0 score_miss=0 head(p/f/miss)=22/10/0
+lazycache r=1 N=13              291.18         266.03     0.05   2.580x   3.404x   75.8%
+                           └ partial k/N=0.0577 (24 步) / 全量 8 步; vsim=0 scored=0 kv_miss=0 score_miss=0 head(p/f/miss)=24/8/0
+
+注: transf = total - VQGAN decode (各档解码相同); speedup 以 transformer-only 计。
+    理论列: lazyvsim 取自 flops_lazy_vsim.py, lazycache 取自 flops_lazy_refresh.py。
